@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.venv/
+venv/
+
+# 环境
+.env
+.envrc
+
+# 数据和模型（不传 git）
+checkpoints/
+data/
+!data/.gitkeep
+!data/input_videos/.gitkeep
+!data/runs/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# 日志
+*.log
