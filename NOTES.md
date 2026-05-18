@@ -1,26 +1,27 @@
 # Development notes
 
-This file is for my running log, decisions, and parameter tuning records. Claude Code should append to this file when it makes notable decisions or completes milestones.
+Running log of decisions, parameter experiments, and open questions. See CLAUDE.md for update rules.
 
-## Log
+---
 
-### YYYY-MM-DD
-- Initialized project
+## 2026-05-17 — Project kickoff
 
-## Decisions
+**Done:**
+- Initial project scaffolding (folders, docs)
+- Environment set up: conda env `bodymvp`, Python 3.10, PyTorch 2.4.1 + CUDA 12.1, PyTorch3D verified on RTX 3090
+- PROJECT.md and CLAUDE.md drafted; iterated several times to clarify the project/collaboration boundary
 
-(Append important architecture / dependency / algorithm decisions here with date)
+**Decisions:**
+- Stage 3 must produce dual output: A-pose mesh (display) + analysis data (posture, shape) for Layer 2
+- Each stage stays in a single file; flat package layout, not nested
+- Hyperparameters live in config.py, not locked in PROJECT.md
+- Model versions chosen per-milestone, not specified upfront
 
-## Parameter tuning log (Stage 2)
+**Open questions:**
+- Specific algorithm for `theta_natural` — to be decided in M9
+- Whether to use medoid frame or geodesic rotation averaging
 
-| Date | Loss weights | IoU | Visual quality notes |
-|------|--------------|-----|----------------------|
+**Next:**
+- M1b: code scaffolding (Click CLI, empty stage stubs, config.py)
 
-## Open questions
-
-- [ ] How many keyframes is optimal? Start with 12, validate later.
-- [ ] Symmetry weight — start at 0.01, adjust based on volunteers with asymmetry.
-
-## Useful references
-
-(Papers, repos, threads found during development)
+---

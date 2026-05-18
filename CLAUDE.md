@@ -1,48 +1,125 @@
-# Working style for this project
+# Working agreement (Claude Code ↔ me)
 
-## About me & this project
-I'm a solo developer building an MVP for a 3D body reconstruction pipeline. See PROJECT.md for full context. I'm using Claude Code for the first time on this project — go slow with me.
+This file is about **how we work together**, not what we're building. For project content, see PROJECT.md.
 
-## Core principles
-1. **Working end-to-end > clean architecture.** I'd rather have ugly code that runs than beautiful code that doesn't.
-2. **Small steps, visible results.** Each change should produce something I can see or run.
-3. **Ask before assuming.** I'd rather answer a question than undo a wrong assumption.
+## Context
 
-## Do
-- Before writing code: outline the plan in plain English and wait for my approval
-- Suggest the simplest solution that works for an MVP
-- Explain *why* before writing code, especially for non-trivial decisions
-- Write small, focused changes I can review in one sitting
-- When adding a dependency, tell me what it does and why we need it
-- When debugging, ask for the actual error message before guessing
-- After completing a milestone, update PROJECT.md status and NOTES.md log
+I'm a solo developer building an MVP. This is my first time using Claude Code on a real project — go slow with me.
 
-## Don't
-- Don't create new files unless necessary — prefer editing existing ones
-- Don't split single files into modules "for organization" — see PROJECT.md, each stage stays in one file
+---
+
+## Documentation system
+
+This repo uses three living documents. Knowing the difference is important — putting content in the wrong file degrades all three.
+
+### PROJECT.md — "what we're building"
+A neutral, factual snapshot of the project: vision, architecture, milestones, data contracts, current status, known pitfalls. Reads like onboarding documentation for any new developer (human or AI).
+
+**Update rules:**
+- After completing a milestone: tick the checkbox under "Development milestones" and update "Current status"
+- When discovering a new pitfall or design constraint: add to "Implementation pitfalls" or "Known issues"
+- When making a meaningful architecture decision: reflect it in the relevant section
+- **Don't add** AI-collaboration instructions ("don't do X", "please remember Y") — those belong in CLAUDE.md
+- **Don't add** implementation-detail specifics (loss weights, specific model versions, algorithm pseudocode) — those belong in code/comments
+- **Don't change** scope (milestones, architecture) without asking me first
+
+### CLAUDE.md — "how we work together" (this file)
+Collaboration agreement: workflow, style preferences, boundaries. Auto-loaded by Claude Code at session start.
+
+**Update rules:**
+- When we discover a new working pattern that helps: add it here
+- When a recurring annoyance comes up: codify the rule here
+- Ask before making changes — this is the contract between us
+
+### NOTES.md — "running log"
+Dated, append-only log of what happened, decisions made, parameters tried, open questions. Like a lab notebook.
+
+**Update rules:**
+- Append at the end of each working session
+- Use date-stamped entries: `## YYYY-MM-DD`
+- Record: what was accomplished, key decisions and *why*, parameters tried (for Stage 2 tuning especially), open questions
+- Never edit past entries — append corrections as new entries
+
+---
+
+## Session lifecycle
+
+### At the start of a session
+- Confirm CLAUDE.md is loaded (it auto-loads)
+- Read PROJECT.md, especially "Current status" and the section for the current milestone
+- Read the most recent entries in NOTES.md to know what just happened
+- Summarize back to me: current milestone, last session's outcome, anything pending
+
+### During work
+- Outline the plan in plain English before writing code; wait for my approval
+- Write small, focused changes I can review — not large code dumps
+- When debugging, ask for the actual error before guessing
+- Suggest the simplest solution that works for MVP
+- Explain *why* before *how* for non-trivial choices
+
+### Before ending a session
+- Update PROJECT.md if a milestone was completed (checkbox + Current status)
+- Append a new dated entry to NOTES.md summarizing what happened, decisions made, open questions
+- Suggest a one-line git commit message
+
+---
+
+## Boundaries
+
+- Don't create new files unless necessary; prefer editing existing ones
+- Don't propose splitting single-file stages into submodules — the flat layout is intentional
 - Don't refactor unrelated code while doing a task
 - Don't add abstraction layers, base classes, or interfaces "for future flexibility"
-- Don't write unit tests unless I explicitly ask
-- Don't generate large code blocks all at once — break into reviewable chunks
+- Don't write unit tests unless I ask
 - Don't silently install packages — ask first
-- Don't change PROJECT.md milestones or scope without asking
+- Don't change PROJECT.md scope (milestones, architecture) without asking
+- Implement only the current milestone's scope; if a future feature seems "easy to add now", propose it, don't sneak it in
 
-## Code style
-- Type hints on function signatures, but skip overly verbose typing inside functions
-- Docstrings on public functions, single-line OK for simple ones
-- Prefer `pathlib.Path` over `os.path`
-- Prefer `loguru` over `print` for anything that should persist
-- Use `numpy` arrays for math, `torch.Tensor` only inside model code
-- Constants in `config.py`, not magic numbers in code
+---
+
+## Reuse over reimplementation
+
+Always prefer reusing existing open-source models/libraries over writing algorithms from scratch.
+
+Priority order for any algorithmic capability:
+1. Official pip package with clean API (best)
+2. Official GitHub repo's demo/inference script, wrapped thinly
+3. Modifying source from a forked repo (avoid unless necessary)
+4. Implementing from scratch (only if no alternative exists)
+
+When suggesting a new dependency, tell me:
+- What it does
+- License (especially: is it commercial-friendly?)
+- Whether it's pip-installable or repo-clone required
+- A simpler alternative if any
+
+---
+
+## Code style preferences
+
+- Python 3.10 syntax: `list[str]`, `dict[str, int]`, `X | None` — not `List/Dict/Optional`
+- Type hints on function signatures; lighter inside function bodies
+- `pathlib.Path` over `os.path`
+- `loguru` over `print` for anything worth keeping
+- numpy arrays for math; `torch.Tensor` only inside model code
+- Constants in `config.py`, not magic numbers scattered in code
+- Docstrings on public functions; one-liners are fine for simple stuff
+
+---
 
 ## When unsure
+
 Ask me. Especially about:
-- Architecture decisions
-- License-sensitive dependencies  
-- Algorithm choices that affect quality
-- Anything that touches the data contract between stages
+- Architecture / module boundary decisions
+- License-sensitive dependencies
+- Algorithm choices that affect output quality
+- Anything touching the data contract between stages (Stage1Result / Stage2Result / Stage3Result)
+
+I'd rather answer a question than undo a wrong assumption.
+
+---
 
 ## Useful commands
+
 - Run pipeline: `python scripts/run.py <video> --height H --weight W`
-- Download models: `bash scripts/download_models.sh`
 - View latest run: `ls data/runs/`
