@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# Download model checkpoints into checkpoints/.
-# Each milestone adds its models here as they are needed.
+# Run from the repo root. Each milestone adds its models below.
 
 set -euo pipefail
 
-echo "download_models.sh: not implemented yet"
-echo "See PROJECT.md §Model checkpoints for manual download instructions."
+# --- M3: SAM 2.1 small (person segmentation) ---
+if [ ! -f checkpoints/sam2/sam2.1_hiera_small.pt ]; then
+    mkdir -p checkpoints/sam2
+    wget -q --show-progress \
+        -O checkpoints/sam2/sam2.1_hiera_small.pt \
+        https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt
+fi

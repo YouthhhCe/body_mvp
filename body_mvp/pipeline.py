@@ -13,6 +13,7 @@ from body_mvp.config import NUM_KEYFRAMES, settings
 def _create_run_dir(run_id: str) -> Path:
     run_dir = settings.runs_dir / run_id
     (run_dir / "keyframes").mkdir(parents=True, exist_ok=False)
+    (run_dir / "masks").mkdir(parents=True, exist_ok=False)
     (run_dir / "logs").mkdir(parents=True, exist_ok=False)
     return run_dir
 
@@ -95,7 +96,8 @@ def run(video_path: Path, height: float, weight: float, gender: str) -> None:
     (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
     logger.info("Wrote meta.json")
 
-    extract_keyframes(video_path, run_dir)
+    keyframe_paths = extract_keyframes(video_path, run_dir)
+    stage1.segment_keyframes(keyframe_paths, run_dir)
 
     stage1.run(video_path, height, weight, gender)
     stage2.run()

@@ -10,6 +10,11 @@ dependencies = [
     # torch and pytorch3d must be installed manually before `pip install -e .`
     # Their CUDA-specific wheels are not on PyPI. See README for install commands.
 
+    # SAM 2 — no PyPI package; must be installed with --no-deps (its torch>=2.5.1 metadata
+    # pin would upgrade our torch 2.4.1+cu121, breaking PyTorch3D). Install separately:
+    # SAM2_BUILD_CUDA=0 pip install --no-deps git+https://github.com/facebookresearch/sam2.git
+    "sam2 @ git+https://github.com/facebookresearch/sam2.git",
+
     # numpy: <2 required — numpy 2 breaks pytorch3d and smplx C extensions
     "numpy>=1.26,<2",
 

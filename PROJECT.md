@@ -205,7 +205,7 @@ Each stage lives in a single file by design. `body_mvp/` is a flat package, not 
   - Goal: extract a set of keyframe images from the spinning video
   - Acceptance: running the CLI on `test.mp4` produces keyframe jpgs in `data/runs/<id>/keyframes/` that visibly cover different angles of the subject
 
-- [ ] **M3 — Keyframes to masks**
+- [ ] **M3 — Keyframes to masks** *(partial — heuristic box works for front/back views; side-view frames misfire onto background; revisit with keypoint-guided box after M5)*
   - Goal: SAM 2 produces a clean person mask for each keyframe
   - Acceptance: mask-overlay visualization shows the person cleanly segmented across all keyframes
 
@@ -260,15 +260,16 @@ Things that have bitten others working on similar pipelines:
 
 ## Current status
 
-Milestone: M3 — Keyframes to masks (M2 complete).
+M3 partial (SAM 2 pipeline runs end-to-end; 8/12 keyframes segmented cleanly; 4 side-view frames misfire onto background). Next milestone: M4.
 
 Environment:
 - Conda env `bodymvp` (Python 3.10)
 - PyTorch 2.4.1 + CUDA 12.1, GPU-verified
 - PyTorch3D installed and GPU-verified
-- Base libraries: numpy 1.26, opencv, smplx, trimesh, click, loguru, pydantic
+- SAM 2 (facebookresearch/sam2 @ 2b90b9f5) installed via git+pip --no-deps
+- Base libraries: numpy 1.26, opencv, smplx, trimesh, click, loguru, pydantic, hydra-core
 - Project installed as editable package via `pip install -e .`
-- Model checkpoints not yet downloaded
+- Checkpoints: `sam2.1_hiera_small.pt` downloaded; SMPL not yet downloaded
 
 ---
 
