@@ -197,49 +197,50 @@ Each stage lives in a single file by design. `body_mvp/` is a flat package, not 
 
 ## Development milestones
 
-### M1 — Scaffolding
-**Goal:** runnable CLI skeleton with proper file structure.
-**Acceptance:** `python scripts/run.py --help` works; running on a video prints "not implemented yet".
+- [x] **M1 — Scaffolding**
+  - Goal: runnable CLI skeleton with proper file structure
+  - Acceptance: `python scripts/run.py --help` works; running on a video prints "not implemented yet"
 
-### M2 — Video to keyframes
-**Goal:** extract a set of keyframe images from the spinning video.
-**Acceptance:** running the CLI on `test.mp4` produces keyframe jpgs in `data/runs/<id>/keyframes/` that visibly cover different angles of the subject.
+- [ ] **M2 — Video to keyframes**
+  - Goal: extract a set of keyframe images from the spinning video
+  - Acceptance: running the CLI on `test.mp4` produces keyframe jpgs in `data/runs/<id>/keyframes/` that visibly cover different angles of the subject
 
-### M3 — Keyframes to masks
-**Goal:** SAM 2 produces a clean person mask for each keyframe.
-**Acceptance:** mask-overlay visualization shows the person cleanly segmented across all keyframes.
+- [ ] **M3 — Keyframes to masks**
+  - Goal: SAM 2 produces a clean person mask for each keyframe
+  - Acceptance: mask-overlay visualization shows the person cleanly segmented across all keyframes
 
-### M4 — Keyframes to SMPL β/θ
-**Goal:** 4D Humans gives shape and pose parameters per keyframe.
-**Acceptance:** rendering the SMPL mesh overlaid on each original keyframe shows reasonable alignment with the body silhouette.
+- [ ] **M4 — Keyframes to SMPL β/θ**
+  - Goal: 4D Humans gives shape and pose parameters per keyframe
+  - Acceptance: rendering the SMPL mesh overlaid on each original keyframe shows reasonable alignment with the body silhouette
 
-### M5 — Keypoints + Normal maps
-**Goal:** per-frame 2D keypoints and surface normal predictions.
-**Acceptance:** keypoint overlay and normal map visualizations look sensible per frame.
+- [ ] **M5 — Keypoints + Normal maps**
+  - Goal: per-frame 2D keypoints and surface normal predictions
+  - Acceptance: keypoint overlay and normal map visualizations look sensible per frame
 
-### M6 — Stage 1 end-to-end
-**Goal:** unified `Stage1Result` produced from a single CLI run, saved to disk.
-**Acceptance:** can load `Stage1Result` from disk in a REPL and inspect all fields.
+- [ ] **M6 — Stage 1 end-to-end**
+  - Goal: unified `Stage1Result` produced from a single CLI run, saved to disk
+  - Acceptance: can load `Stage1Result` from disk in a REPL and inspect all fields
 
-### M7 — Stage 2 minimal optimization
-**Goal:** ΔV optimization loop runs with just silhouette loss (+ basic regularizer).
-**Acceptance:** loss decreases over iterations; final ΔV is non-zero; mesh silhouette visibly closer to mask than initial SMPL.
+- [ ] **M7 — Stage 2 minimal optimization**
+  - Goal: ΔV optimization loop runs with just silhouette loss (+ basic regularizer)
+  - Acceptance: loss decreases over iterations; final ΔV is non-zero; mesh silhouette visibly closer to mask than initial SMPL
 
-### M8 — Stage 2 full loss + tuning
-**Goal:** all loss terms enabled and weights tuned on the test video.
-**Acceptance:** 4-view comparison renders (sculpted mesh vs original keyframes) look like the user. This is the longest milestone.
+- [ ] **M8 — Stage 2 full loss + tuning**
+  - Goal: all loss terms enabled and weights tuned on the test video
+  - Acceptance: 4-view comparison renders (sculpted mesh vs original keyframes) look like the user
+  - Note: this is the longest milestone
 
-### M9 — Stage 3 dual output
-**Goal:** produce display GLB + complete `Stage3Result`.
-**Acceptance:** GLB opens in a standard GLB viewer and shows a recognizable human in A-pose; `Stage3Result` has all defined fields populated correctly.
+- [ ] **M9 — Stage 3 dual output**
+  - Goal: produce display GLB + complete `Stage3Result`
+  - Acceptance: GLB opens in a standard GLB viewer and shows a recognizable human in A-pose; `Stage3Result` has all defined fields populated correctly
 
-### M10 — Web viewer
-**Goal:** in-browser viewer with rotate/zoom.
-**Acceptance:** user can interact with the mesh in a browser; material has some visual polish.
+- [ ] **M10 — Web viewer**
+  - Goal: in-browser viewer with rotate/zoom
+  - Acceptance: user can interact with the mesh in a browser; material has some visual polish
 
-### M11 — Evaluation
-**Goal:** validate on multiple volunteers.
-**Acceptance:** for 5+ subjects, produce comparison renders and collect self-similarity scores.
+- [ ] **M11 — Evaluation**
+  - Goal: validate on multiple volunteers
+  - Acceptance: for 5+ subjects, produce comparison renders and collect self-similarity scores
 
 ---
 
@@ -259,13 +260,14 @@ Things that have bitten others working on similar pipelines:
 
 ## Current status
 
-Milestone: M1 in progress (environment installed, code scaffolding pending).
+Milestone: M2 — Video to keyframes (M1 complete).
 
 Environment:
 - Conda env `bodymvp` (Python 3.10)
 - PyTorch 2.4.1 + CUDA 12.1, GPU-verified
 - PyTorch3D installed and GPU-verified
 - Base libraries: numpy 1.26, opencv, smplx, trimesh, click, loguru, pydantic
+- Project installed as editable package via `pip install -e .`
 - Model checkpoints not yet downloaded
 
 ---

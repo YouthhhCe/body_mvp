@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "body-mvp"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    # torch and pytorch3d must be installed manually before `pip install -e .`
+    # Their CUDA-specific wheels are not on PyPI. See README for install commands.
+
+    # numpy: <2 required — numpy 2 breaks pytorch3d and smplx C extensions
+    "numpy>=1.26,<2",
+
+    # Body model
+    "smplx>=0.1.28",
+
+    # Geometry / vision
+    "opencv-python>=4.11.0",
+    "trimesh>=4.12.2",
+    "pillow>=12.2.0",
+    "scipy>=1.15.3",
+
+    # CLI + config
+    "click>=8.4.0",
+    "pydantic>=2.13.4",
+    "pydantic-settings>=2.14.1",
+    "python-dotenv>=1.2.2",
+
+    # Logging / progress
+    "loguru>=0.7.3",
+    "tqdm>=4.67.3",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["body_mvp*"]
