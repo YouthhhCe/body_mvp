@@ -45,3 +45,29 @@ Running log of decisions, parameter experiments, and open questions. See CLAUDE.
 - M2: keyframe extraction from spinning video (`stage1.sample_keyframes`)
 
 ---
+
+## 2026-05-18 — M2 video to keyframes
+
+**Done:**
+- Implemented `extract_keyframes(video_path, run_dir) -> list[Path]` in `pipeline.py`
+- Added `_create_run_dir` helper, timestamp-based `run_id`, per-run loguru file sink, and `meta.json` written at run start
+- 12 keyframes extracted with uniform linspace sampling; all visually cover different spin angles
+- M2 acceptance criterion met
+
+**Decisions:**
+- `extract_keyframes` placed in `pipeline.py`, not `stage1.py` — video I/O is pipeline orchestration, not stage logic (model inference)
+- `exist_ok=False` on run dir creation — fail-loud on same-second collision rather than silently overwriting a prior run
+- `run_id` is `YYYYMMDD_HHMMSS` for free chronological ordering via `ls`
+- Don't trust `CAP_PROP_FRAME_COUNT`; probe backwards for actual last readable index, then `linspace(0, last_readable, N)` — this video over-reported by 25 frames (351 vs 326 actual), which would have broken any fixed-offset workaround
+- `stage1.py` stub left as `*args, **kwargs` — real signature deferred to M3–M6
+
+**Surprises:**
+- Codec over-report was 25 frames, not 1. Validates probe-over-offset approach.
+
+**Known debt:**
+- `logger.add()` inside `run()` accumulates sinks if pipeline is called multiple times in one process; harmless for single-shot CLI, needs lifecycle fix before tests or web service
+
+**Next:**
+- M3: SAM 2 person mask per keyframe
+
+---

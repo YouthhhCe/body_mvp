@@ -201,7 +201,7 @@ Each stage lives in a single file by design. `body_mvp/` is a flat package, not 
   - Goal: runnable CLI skeleton with proper file structure
   - Acceptance: `python scripts/run.py --help` works; running on a video prints "not implemented yet"
 
-- [ ] **M2 — Video to keyframes**
+- [x] **M2 — Video to keyframes**
   - Goal: extract a set of keyframe images from the spinning video
   - Acceptance: running the CLI on `test.mp4` produces keyframe jpgs in `data/runs/<id>/keyframes/` that visibly cover different angles of the subject
 
@@ -260,7 +260,7 @@ Things that have bitten others working on similar pipelines:
 
 ## Current status
 
-Milestone: M2 — Video to keyframes (M1 complete).
+Milestone: M3 — Keyframes to masks (M2 complete).
 
 Environment:
 - Conda env `bodymvp` (Python 3.10)

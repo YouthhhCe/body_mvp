@@ -17,7 +17,7 @@ A neutral, factual snapshot of the project: vision, architecture, milestones, da
 
 **Update rules:**
 - After completing a milestone: tick the checkbox under "Development milestones" and update "Current status"
-- When discovering a new pitfall or design constraint: add to "Implementation pitfalls" or "Known issues"
+- When discovering a new pitfall or design constraint: add to "Implementation pitfalls" only if it's architecture- or domain-level
 - When making a meaningful architecture decision: reflect it in the relevant section
 - **Don't add** AI-collaboration instructions ("don't do X", "please remember Y") — those belong in CLAUDE.md
 - **Don't add** implementation-detail specifics (loss weights, specific model versions, algorithm pseudocode) — those belong in code/comments
