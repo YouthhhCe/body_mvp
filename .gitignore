@@ -34,3 +34,5 @@ Thumbs.db
 
 # 日志
 *.log
+# Third-party clones (use download_models.sh to fetch)
+third_party/

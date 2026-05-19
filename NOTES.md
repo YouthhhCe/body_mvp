@@ -104,3 +104,34 @@ Running log of decisions, parameter experiments, and open questions. See CLAUDE.
 
 **Next:**
 - M4: 4D Humans → SMPL β/θ per keyframe
+
+---
+
+## 2026-05-19 — M4 third_party setup (user-driven, not CC)
+
+**Done:**
+- Cloned 4D Humans (`shubham-goel/4D-Humans` @ `efe18de`) to `third_party/4D-Humans/`
+- Installed hmr2 as editable package: `pip install -e . --no-deps`, then manually audited `setup.py` and installed inference-only deps (skipped detectron2, training-only hydra extras, pyrootutils)
+- SMPL v1.0.0 neutral placed at `checkpoints/smpl/basicModel_neutral_lbs_10_207_0_v1.0.0.pkl`; symlinked to `~/.cache/4DHumans/data/smpl/SMPL_NEUTRAL.pkl` for hmr2's expected path
+- 4D Humans checkpoint lives in `~/.cache/4DHumans/`; mirrored into `checkpoints/4dhumans/` via symlinks (decorative only — hmr2 source hardcodes the cache path)
+- Verified end-to-end: `from hmr2.models import load_hmr2` + forward pass on example image → output shapes match data contract (`betas (1,10)`, `body_pose (1,23,3,3)`, `global_orient (1,1,3,3)`)
+- Re-ran M3 pipeline: 8/12 mask clean, 4/12 failed (03/04/08/09) — no regression
+
+**Decisions:**
+- User does this milestone's setup, not CC. Multi-variable env stabilization (repo state, dep audit, torch compat, checkpoint paths, SMPL version mismatch) is CC's weak spot. Tagged `m3-end` before starting; can replay later as a CC capability test.
+- Skipped `[all]` extras (detectron2). Our stage1.py will call `load_hmr2()` directly; person bbox comes from SAM 2 mask (interim) and RTMPose (M5+). Avoids ~4GB CUDA-toolkit install.
+- SMPL v1.0.0 (39MB) vs v1.1.0 (247MB): v1.1.0 adds dynamic blendshapes hmr2 doesn't use. v1.0.0 is smaller, matches what 4D Humans README expects, fully sufficient.
+- hmr2 outputs rotation matrices; stage1.py will convert to axis-angle via `pytorch3d.transforms.matrix_to_axis_angle` to match data contract `theta: [24, 3]`.
+
+**Surprises:**
+- `hmr2_data.tar.gz` from UT Austin (`www.cs.utexas.edu/~pavlakos/`) silently truncated at 352MB (full ~1.1GB+). `download_models()` has no integrity check; `os.system("tar -xvf ...")` swallowed the EOF error. Result: ckpt was 367MB instead of ~2.7GB, `model_config.yaml` missing entirely.
+- **Recovery**: pulled `model_config.yaml` (3KB) and full ckpt (2.7GB) from HuggingFace Space `brjathu/HMR2.0`. HF was stable from CN; UT Austin was not. Kept truncated tar.gz in cache with a `README_DO_NOT_DELETE_TAR.txt` so `download_models()` won't re-download.
+- chumpy mattloper `580566ea` already patches numpy 1.24+ deprecations — `import chumpy` works on numpy 1.26.4 with no manual sed.
+- pytorch-lightning 2.6.1 auto-upgrades 4D Humans' v1.8.1 ckpt format on each load (non-destructive, benign warning).
+
+**Env delta:**
+- 54 new pip packages (see `requirements_frozen.txt` diff). No version changes to torch / pytorch3d / numpy / opencv / sam2.
+- Env name is `dyc_bodymvp` (HANDOFF M3 wrote `bodymvp` — update).
+
+**Next:**
+- M4 implementation by CC: write `stage1.extract_smpl_params(keyframe_paths, run_dir)`. Per-frame `.npz` with betas + body_pose (axis-angle) + global_orient + camera. Acceptance: SMPL mesh overlaid on 4-6 keyframes via hmr2's built-in `Renderer`, covering frontal / side / back angles including the 4 SAM-failed frames.

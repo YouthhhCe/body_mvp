@@ -164,7 +164,12 @@ No web service yet. Run via CLI:
 
 ## Model checkpoints
 
-Model files live in `checkpoints/<name>/`. Specific versions are chosen as each milestone needs them. SMPL requires manual download with account registration at smpl.is.tue.mpg.de; others can typically be auto-downloaded.
+Model files live in `checkpoints/<name>/`. Versions chosen per milestone. SMPL requires manual download at smpl.is.tue.mpg.de.
+
+Currently downloaded:
+- `sam2/sam2.1_hiera_small.pt` (M3)
+- `smpl/basicModel_neutral_lbs_10_207_0_v1.0.0.pkl` (M4; 4D Humans expects v1.0.0)
+- `4dhumans/` — symlinks to `~/.cache/4DHumans/` (hmr2 source hardcodes the cache path; symlinks are decorative)
 
 ---
 
@@ -260,16 +265,18 @@ Things that have bitten others working on similar pipelines:
 
 ## Current status
 
-M3 partial (SAM 2 pipeline runs end-to-end; 8/12 keyframes segmented cleanly; 4 side-view frames misfire onto background). Next milestone: M4.
+## Current status
+
+M3 partial (4 side-view masks misfire onto background — to be cleared after M5 with keypoint-guided bbox). M4 third_party setup complete: 4D Humans installed, SMPL v1.0.0 in place, hmr2 inference verified end-to-end. Next: M4 implementation (`stage1.extract_smpl_params`).
 
 Environment:
-- Conda env `bodymvp` (Python 3.10)
-- PyTorch 2.4.1 + CUDA 12.1, GPU-verified
-- PyTorch3D installed and GPU-verified
-- SAM 2 (facebookresearch/sam2 @ 2b90b9f5) installed via git+pip --no-deps
-- Base libraries: numpy 1.26, opencv, smplx, trimesh, click, loguru, pydantic, hydra-core
+- Conda env `dyc_bodymvp` (Python 3.10)
+- PyTorch 2.4.1 + CUDA 12.1, GPU-verified (RTX 3090)
+- PyTorch3D 0.7.8, GPU-verified
+- SAM 2 (`facebookresearch/sam2` @ `2b90b9f5`) — git+pip --no-deps
+- 4D Humans (`shubham-goel/4D-Humans` @ `efe18de`) in `third_party/`, installed with `pip install -e . --no-deps`
+- chumpy (`mattloper` @ `580566ea`), pytorch-lightning 2.6.1, pyrender, scikit-image, timm, einops (full list in `requirements_frozen.txt`)
 - Project installed as editable package via `pip install -e .`
-- Checkpoints: `sam2.1_hiera_small.pt` downloaded; SMPL not yet downloaded
 
 ---
 
