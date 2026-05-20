@@ -146,8 +146,8 @@ Layer 2 will be a separate module that imports Layer 1's `Stage3Result`.
 - PyTorch3D (differentiable rendering)
 - SAM 2 (Meta, Apache 2.0)
 - 4D Humans (Berkeley, non-commercial license — MVP only)
-- 2D keypoint detector — RTMPose is the current pick (Apache 2.0)
-- Surface normal predictor — Sapiens-Normal is the current pick; check license for the specific checkpoint
+- RTMPose via `rtmlib` 0.0.15 + `onnxruntime-gpu` 1.19.2 (Apache 2.0) — YOLOX-m detector + RTMPose-m body7 ONNX
+- Sapiens-Normal 0.3B torchscript (Meta, Sapiens License — non-commercial, MVP only)
 - smplx (Max Planck, non-commercial license — MVP only)
 - trimesh, Click, loguru, pydantic
 
@@ -170,6 +170,8 @@ Currently downloaded:
 - `sam2/sam2.1_hiera_small.pt` (M3)
 - `smpl/basicModel_neutral_lbs_10_207_0_v1.0.0.pkl` (M4; 4D Humans expects v1.0.0)
 - `4dhumans/` — symlinks to `~/.cache/4DHumans/` (hmr2 source hardcodes the cache path; symlinks are decorative)
+- `rtmpose/yolox_m.onnx` + `rtmpose/rtmpose_m_body7.onnx` (M5; rtmlib 'balanced' mode)
+- `sapiens/sapiens_0.3b_normal_render_people_epoch_66_torchscript.pt2` (M5; 0.3B chosen for VRAM headroom — see NOTES.md 2026-05-20)
 
 ---
 
@@ -210,7 +212,7 @@ Each stage lives in a single file by design. `body_mvp/` is a flat package, not 
   - Goal: extract a set of keyframe images from the spinning video
   - Acceptance: running the CLI on `test.mp4` produces keyframe jpgs in `data/runs/<id>/keyframes/` that visibly cover different angles of the subject
 
-- [ ] **M3 — Keyframes to masks** *(partial — heuristic box works for front/back views; side-view frames misfire onto background; revisit with keypoint-guided box after M5)*
+- [x] **M3 — Keyframes to masks**
   - Goal: SAM 2 produces a clean person mask for each keyframe
   - Acceptance: mask-overlay visualization shows the person cleanly segmented across all keyframes
 
@@ -218,7 +220,7 @@ Each stage lives in a single file by design. `body_mvp/` is a flat package, not 
   - Goal: 4D Humans gives shape and pose parameters per keyframe
   - Acceptance: rendering the SMPL mesh overlaid on each original keyframe shows reasonable alignment with the body silhouette
 
-- [ ] **M5 — Keypoints + Normal maps**
+- [x] **M5 — Keypoints + Normal maps**
   - Goal: per-frame 2D keypoints and surface normal predictions
   - Acceptance: keypoint overlay and normal map visualizations look sensible per frame
 
@@ -265,7 +267,7 @@ Things that have bitten others working on similar pipelines:
 
 ## Current status
 
-M4 complete. Stage 1's first sub-task (`extract_smpl_params`) is implemented and verified; 12 per-keyframe `.npz` files contain SMPL betas/pose/camera, and visual overlays show reasonable mesh-to-silhouette alignment across all keyframes (including the 4 with M3-failed masks). M3 mask debt still pending — to be fixed after M5 with keypoint-derived bbox. Next: M5 (keypoints + normals).
+M5 complete. All four Stage 1 per-frame sub-tasks now exist on disk for the 12 keyframes of `test.mp4`: masks (SAM 2, all 12 clean after the M5 keypoint-guided refine), SMPL β/θ (4D Humans), 2D keypoints (RTMPose COCO-17), and surface normals (Sapiens-Normal 0.3B, camera-frame). M3 mask debt is resolved — the 4 previously-failed side-view frames were re-run via `refine_masks_with_keypoints` using a keypoint-derived bbox. `pipeline.run()` integration of all sub-tasks into `Stage1Result` is still M6's job. Next: M6.
 
 Environment (verified reproducible on a second LAN server; see `MIGRATION_GUIDE.md`):
 - Conda env `dyc_bodymvp` (Python 3.10)
@@ -273,6 +275,7 @@ Environment (verified reproducible on a second LAN server; see `MIGRATION_GUIDE.
 - PyTorch3D 0.7.8, GPU-verified
 - SAM 2 (`facebookresearch/sam2` @ `2b90b9f5`) — git+pip `--no-deps`
 - 4D Humans (`shubham-goel/4D-Humans` @ `efe18de`) in `third_party/`, installed with `pip install -e . --no-deps`
+- rtmlib 0.0.15 (`--no-deps`) + onnxruntime-gpu 1.19.2 (CUDA 12, cuDNN 9)
 - chumpy (`mattloper` @ `580566ea`), pytorch-lightning 2.6.1, pyrender, scikit-image, timm, einops (full list in `requirements_frozen.txt`)
 - Project installed as editable package via `pip install -e .`
 

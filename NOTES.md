@@ -167,3 +167,37 @@ Running log of decisions, parameter experiments, and open questions. See CLAUDE.
 **Next:**
 - HANDOFF M4 → M5 decision-reviewer.
 - M5: 2D keypoints (RTMPose) + surface normals (Sapiens-Normal). After RTMPose lands, re-run M3 with keypoint-derived person bbox to fix the 4 failed side-view masks (long-standing debt).
+
+---
+
+## 2026-05-20 — M5 keypoints + normals + M3 mask debt fix
+
+**Done:**
+- `body_mvp/stage1.py`: added `extract_keypoints`, `render_keypoint_overlays`, `_keypoints_to_bbox`, `refine_masks_with_keypoints`, `extract_normals`, `render_normal_overlays`. New module constants for both pipelines pinned to `config.py` Settings (`rtmpose_det_checkpoint`, `rtmpose_pose_checkpoint`, `sapiens_normal_checkpoint`). Not integrated into `pipeline.run()` — that's M6.
+- M5 acceptance passed on run `20260519_215818`: 12 `kp_NN.npz` + 12 `keypoints/overlay_NN.png` + 12 `normal_NN.npz` + 12 `normals/vis_NN.png`. Keypoint overlays show clean COCO-17 skeletons on all 12 frames including the 4 previously mask-failed side views. Normal maps show anatomically consistent camera-frame normals (smooth surface gradients, distinct front/back/limb regions).
+- M3 mask debt resolved (`refine_masks_with_keypoints`): the 4 side-view frames (03/04/08/09) were re-run with a keypoint-derived bbox (min/max of keypoints with score ≥ 0.3, padded 10% per side) as SAM's box prompt. Old SAM scores 0.22–0.35 → new 0.92–0.97. Coverages 4.2–6.9% → 9.3–12.8%. Wardrobe door correctly excluded across all 4 refined frames; M3 milestone now ticked complete.
+
+**Decisions:**
+- **Mask-failure detection criterion: single `coverage < 9%`.** Mask coverage data on the run showed a clean 4.4-pp gap (good frames 11.3–14.6%, failed 4.2–6.9%); 9% sits in the gap with margin both ways. A 2-of-3 voting alternative (coverage + aspect h/w + fill-in-bbox) was proposed but rejected — single signal works on this data, multi-signal is over-engineering for a one-off fix on one run (CLAUDE.md "no future-flexibility layers").
+- **RTMPose model variant: rtmlib `Body` 'balanced' mode (yolox-m det + rtmpose-m body7 pose, both ONNX).** The 4 failed-mask frames have the subject clearly visible (just off-center); yolox-m at 640×640 is more than enough. lightweight's yolox-tiny at 416×416 would be a real risk on side views; performance's yolox-x adds ~400 MB without buying anything M5 acceptance needs.
+- **Sapiens-Normal checkpoint: 0.3B torchscript.** Decision chain in M5 setup: tried 1B → OOM on RTX 3090 (>24 GB peak); 0.6B fits at ~18.9 GB but leaves only ~5.4 GB headroom — too tight for M7+ when PyTorch3D differentiable rendering adds VRAM pressure; 0.3B at ~14.1 GB peak (setup-time measurement) leaves ~10.3 GB headroom. Accepting the quality tradeoff for the headroom. License is Sapiens License (non-commercial), consistent with the existing 4D Humans / SMPL stance.
+- **Sapiens preprocess locked in (NOT the same as ImageNet vision defaults):** BGR channel order (no swap from `cv2.imread`), pixels stay in 0–255 (no /255), `mean=[123.5,116.5,103.5]`, `std=[58.5,57.0,57.5]`. Input shape `[1, 3, 1024, 768]` (H=1024, W=768; `cv2.resize` takes (W,H)). Output is half-resolution `[1, 3, 512, 384]` — bilinear-upsample before applying foreground mask. Wrap forward in `torch.inference_mode()` to avoid OOM across frames. Documented in the `extract_normals` docstring and `_SAPIENS_*` module constants.
+- **Sapiens output coordinate frame: CAMERA, not world.** Predictor has no way to know world orientation. Stored normals are RAW (not necessarily unit length — Sapiens output magnitudes 0.95–0.97 across frames; visualization normalizes per-pixel before mapping `(n+1)/2*255`). Aligning camera-frame normals to SMPL/world frame is M8 work for the normal-consistency loss.
+- **Feed FULL keyframe to Sapiens, not a person crop.** Per Sapiens-Pytorch-Inference project notes, cropping degrades quality even with generous padding. Background gets zeroed out post-inference using the SAM mask.
+
+**Surprises:**
+- **Peak VRAM discrepancy on Sapiens 0.3B:** M5 setup smoke test measured ~14.1 GB peak (presumably from nvidia-smi during JIT warmup on the first forward, which includes allocator reserve + kernel compilation); actual inference loop on 12 frames measured 2.72 GB via `torch.cuda.max_memory_allocated()` (tensor-only, post-warmup, after `torch.inference_mode`). The two numbers measure different things — don't conflate. The real number for steady-state inference is closer to ~3 GB; the 14.1 GB figure is the safer estimate when budgeting M7/M8 alongside PyTorch3D rendering, since first-forward JIT warmup will recur whenever the model is re-loaded in a fresh process.
+- **Plan-doc misstatement caught mid-execution:** the install plan I (CC) wrote claimed rtmlib's default detector is "YOLOX-Nano-Person (~12 MB)". Reading rtmlib source mid-task showed rtmlib's `Body` wrapper offers only `lightweight`/`balanced`/`performance` modes using YOLOX-tiny / -m / -x respectively — no Nano variant exists in rtmlib's defaults. The "~12 MB" was also wrong; smallest available is YOLOX-tiny at ~18 MB on the wire. Recording the correction here so future-me doesn't rediscover the discrepancy. Pattern to remember: don't write package internals from memory in approved plans; verify against source first.
+
+**Implementation pitfalls noted (not architecture-level; not promoting to PROJECT.md):**
+- `pip install rtmlib` declares `onnxruntime` (CPU) and `opencv-contrib-python` as deps. The CPU onnxruntime would shadow `onnxruntime-gpu`, and contrib opencv conflicts with plain `opencv-python`. Always install with `--no-deps` (same general rule SAM 2 introduced in M3).
+- ONNX Runtime providers must be probed after install — listing `CUDAExecutionProvider` is necessary but not sufficient evidence the model runs on GPU. Our smoke test confirmed via timing + GPU utilization. The "Some nodes were not assigned to the preferred execution providers" warning from ORT is benign (shape ops kept on CPU for perf).
+- rtmlib's `Body.__call__` doesn't expose intermediate bboxes. We construct `YOLOX` and `RTMPose` directly so we can store the detector bbox in the per-frame `.npz` (downstream Stage 2 keypoint reprojection loss might want it; also useful for the M3 mask refine).
+- When zero persons detected (didn't happen on test.mp4, but coded for it): save zeros + `bbox_source="none"` so downstream `refine_masks_with_keypoints` can skip cleanly rather than corrupt SAM with a zero bbox.
+
+**Open questions:**
+- For Stage 2 keypoint reprojection loss (M7/M8): which subset of COCO-17 maps cleanly to SMPL's 24 joints? Standard answer is a fixed mapping (shoulders, elbows, wrists, hips, knees, ankles); face keypoints (nose, eyes, ears) don't have SMPL analogues. Defer to M7.
+- Boxer-shorts pattern dotted-hole artifact in normal vis: the printed text on the underwear gets segmented as background by SAM 2, zeroing the normals there. Small in area, won't materially affect Stage 2. Leave it for now; if it bites, the fix is to dilate the SAM mask slightly before zeroing — but that's a Stage 2-era decision.
+
+**Next:**
+- M6: `pipeline.run()` end-to-end integration. Aggregate keyframes + masks + SMPL params + keypoints + normals into a unified `Stage1Result` dataclass, persist to disk under `data/runs/<id>/stage1_result.npz` (or similar), and verify load-from-disk in a REPL inspects all fields cleanly.
