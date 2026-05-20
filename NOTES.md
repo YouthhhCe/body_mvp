@@ -135,3 +135,35 @@ Running log of decisions, parameter experiments, and open questions. See CLAUDE.
 
 **Next:**
 - M4 implementation by CC: write `stage1.extract_smpl_params(keyframe_paths, run_dir)`. Per-frame `.npz` with betas + body_pose (axis-angle) + global_orient + camera. Acceptance: SMPL mesh overlaid on 4-6 keyframes via hmr2's built-in `Renderer`, covering frontal / side / back angles including the 4 SAM-failed frames.
+
+---
+
+## 2026-05-19 — M4 implementation complete + cross-machine migration test
+
+**Done:**
+- Wrote `extract_smpl_params(keyframe_paths, mask_paths, run_dir)` and `render_smpl_overlays(keyframe_paths, npz_paths, run_dir)` in `body_mvp/stage1.py`. Not integrated into `pipeline.run()` — that's M6 (Stage1Result assembly).
+- M4 acceptance passed on both machines: 12 .npz files (betas, body_pose axis-angle, global_orient axis-angle, pred_cam, pred_cam_t, focal_length, bbox, bbox_source) + 12 mesh overlay PNGs. Silhouette alignment visually OK across frontal / side / back views including the 4 SAM-failed frames.
+- Cross-machine migration: copied project to a second LAN server (Ubuntu 20.04, same RTX 3090) by git clone + rsync + env rebuild. Full M3 sanity + M4 acceptance reproduced. Mask coverage matched the source machine to the third decimal place (deterministic).
+
+**Decisions:**
+- hmr2 outputs rotation matrices; we convert to axis-angle (per data contract) via `pytorch3d.transforms.matrix_to_axis_angle`. Per-frame betas saved as-is, averaging deferred to M6.
+- Bbox source per frame: SAM 2 mask bbox when coverage ≥ 8% (8 frames), else fall back to M3's heuristic center-crop box (4 frames). 8% threshold derived from M3 run data; documented as module constant in stage1.py.
+- `render_smpl_overlays` is a separate function from inference (a `.npz` reader). Pipeline doesn't call it; it's an acceptance tool. Rationale: decouple inference success from rendering env fragility.
+- 4 npz fields beyond betas/pose were added (pred_cam, pred_cam_t, focal_length, bbox + bbox_source) — these are free outputs of the hmr2 forward; storing now avoids re-running inference in M6/M9.
+
+**Surprises:**
+- Migration testing revealed multiple gaps in our setup documentation: pytorch3d wheel URL pattern, SAM 2 install ordering, chumpy `--no-build-isolation`, hydra-core as a separate SAM 2 dep, pyrender mandatory even for inference-only paths. All consolidated into a separate `MIGRATION_GUIDE.md` rather than expanded here.
+- Found and fixed a real M1 scaffolding bug: `pyproject.toml` listed `sam2 @ git+...` but SAM 2's PyPI metadata declares `sam-2` (hyphenated). `pip install -e .` fails on the name mismatch. Fix: removed the line from pyproject; SAM 2 install is now external-only (already documented in the comment).
+- pyrender worked on the second server's headless GL stack without intervention. The fallback plan (keypoint reprojection) was prepared but not needed.
+
+**Known debt / non-issues:**
+- M3 mask debt unchanged (4 side-view frames still misfire; deferred to post-M5).
+- `pipeline.run()` still returns "not implemented yet" — intentional, M6 integrates all Stage 1 sub-tasks into `Stage1Result` then.
+- hmr2 internal `vertices_to_trimesh` has a leftover `print(...)` that emits one line per render. Cosmetic noise, leave it.
+
+**Migration food for thought (not now):**
+- One-click migration paths worth considering when MVP-level shipping demands it: Docker image (heaviest, most portable), `conda-pack` for env snapshot + rsync for data (medium effort, big speedup), or just a more thorough `scripts/download_models.sh` covering all checkpoints. Out of scope for current milestones.
+
+**Next:**
+- HANDOFF M4 → M5 decision-reviewer.
+- M5: 2D keypoints (RTMPose) + surface normals (Sapiens-Normal). After RTMPose lands, re-run M3 with keypoint-derived person bbox to fix the 4 failed side-view masks (long-standing debt).

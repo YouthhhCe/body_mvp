@@ -214,7 +214,7 @@ Each stage lives in a single file by design. `body_mvp/` is a flat package, not 
   - Goal: SAM 2 produces a clean person mask for each keyframe
   - Acceptance: mask-overlay visualization shows the person cleanly segmented across all keyframes
 
-- [ ] **M4 — Keyframes to SMPL β/θ**
+- [x] **M4 — Keyframes to SMPL β/θ**
   - Goal: 4D Humans gives shape and pose parameters per keyframe
   - Acceptance: rendering the SMPL mesh overlaid on each original keyframe shows reasonable alignment with the body silhouette
 
@@ -265,15 +265,13 @@ Things that have bitten others working on similar pipelines:
 
 ## Current status
 
-## Current status
+M4 complete. Stage 1's first sub-task (`extract_smpl_params`) is implemented and verified; 12 per-keyframe `.npz` files contain SMPL betas/pose/camera, and visual overlays show reasonable mesh-to-silhouette alignment across all keyframes (including the 4 with M3-failed masks). M3 mask debt still pending — to be fixed after M5 with keypoint-derived bbox. Next: M5 (keypoints + normals).
 
-M3 partial (4 side-view masks misfire onto background — to be cleared after M5 with keypoint-guided bbox). M4 third_party setup complete: 4D Humans installed, SMPL v1.0.0 in place, hmr2 inference verified end-to-end. Next: M4 implementation (`stage1.extract_smpl_params`).
-
-Environment:
+Environment (verified reproducible on a second LAN server; see `MIGRATION_GUIDE.md`):
 - Conda env `dyc_bodymvp` (Python 3.10)
 - PyTorch 2.4.1 + CUDA 12.1, GPU-verified (RTX 3090)
 - PyTorch3D 0.7.8, GPU-verified
-- SAM 2 (`facebookresearch/sam2` @ `2b90b9f5`) — git+pip --no-deps
+- SAM 2 (`facebookresearch/sam2` @ `2b90b9f5`) — git+pip `--no-deps`
 - 4D Humans (`shubham-goel/4D-Humans` @ `efe18de`) in `third_party/`, installed with `pip install -e . --no-deps`
 - chumpy (`mattloper` @ `580566ea`), pytorch-lightning 2.6.1, pyrender, scikit-image, timm, einops (full list in `requirements_frozen.txt`)
 - Project installed as editable package via `pip install -e .`
