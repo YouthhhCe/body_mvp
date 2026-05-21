@@ -123,60 +123,32 @@ Running log of decisions, parameter experiments, and open questions. See CLAUDE.
 
 ## 2026-05-21 — M6 Stage 1 end-to-end (option c + SAM box+points)
 
-**Done:** `pipeline.run()` now drives Stage 1 end-to-end and persists `Stage1Result` to `<run_dir>/stage1_result.npz`. `Stage1Result` is a dataclass in `stage1.py` with `__post_init__` shape/value invariants and a `save/load` pair using only native numpy dtypes (no pickle). A round-trip load self-check fires on every pipeline run and raises on any drift. Acceptance reached on `data/runs/20260521_132028/` — all 12 masks visually correct, β stable to 3 dp across two consecutive runs.
+**Done:** `pipeline.run()` runs Stage 1 end-to-end and persists `Stage1Result` to `<run_dir>/stage1_result.npz`. `Stage1Result` is a dataclass with `__post_init__` invariants and `save/load` (native numpy dtypes, no pickle). Round-trip self-check fires on every run. Acceptance on `data/runs/20260521_132028/` — all 12 masks visually correct, β stable to 3 dp across two consecutive runs.
 
-**Key decisions and WHY:**
+**Decisions:**
+- **Option (c): YOLOX bbox as single source of truth, shared by SAM and hmr2.** Eliminated the `_make_box_prompt` / `_mask_to_bbox` / `refine_masks_with_keypoints` dead-code path rather than keeping brittle gates. Diagnostic origin: M4 used heuristic fallback bbox on 4 side-view frames; M5 fixed masks but never re-ran SMPL — disagreement between SAM and SMPL about person location.
+- **`theta_per_frame: [N, 24, 3]` merged in Stage1Result; smpl_NN.npz keeps hmr2's split layout.** 24-joint is the data contract; hmr2's split is upstream layout. Merge only at construction site.
+- **β = per-component mean across keyframes.** `betas_per_frame` preserved for future re-aggregation (medoid / IQR-trimmed) without re-inference.
+- **`stage1_result.npz` is metadata-only; pixel data via path references.** Round-trip self-check cheap enough to run every invocation.
+- **`bbox_source == "none"` gate after extract_keypoints**: YOLOX failure raises with offender list; no silent fallback. That heuristic-fallback IS the bug option (c) fixes.
 
-- **Option (c) over the smaller-blast-radius (a)/(b) fixes.** The narrow choice was about how to handle the M3-mask-debt SMPL data quality issue I caught after pushback (M4's center-crop fallback bbox on side-view frames 03/04/08/09 was never corrected when M5 fixed the masks). Option (a) was "reorder refine_masks before SMPL"; (b) was "let SMPL fall back to a keypoint-derived bbox". I went with (c): run RTMPose first, use the YOLOX bbox as the single source of truth shared by SAM and hmr2. Rationale: option (c) eliminates the dead-code path (`_make_box_prompt`, `_mask_to_bbox`'s 8% gate, `refine_masks_with_keypoints` from the pipeline) instead of leaving brittle gates that "happen to never fire". Symmetric data flow — SAM and SMPL see the same person extent.
-
-- **`theta_per_frame: [N, 24, 3]` in `Stage1Result`, split layout in `smpl_NN.npz`.** The Stage 2/3 data contract uses the 24-joint convention. hmr2's internal split (`body_pose [23,3]` + `global_orient [3]`) is just upstream layout, not a semantic boundary. Merge at the `Stage1Result` construction site, not in the sub-task .npzs — keeps `render_smpl_overlays` and other debug tools that read smpl_NN.npz unchanged.
-
-- **β aggregation = per-component mean.** β captures shape, not pose; per-frame estimates of the same person should cluster. Mean is the simplest unbiased combiner; `betas_per_frame` is preserved alongside so we can change aggregation later (medoid, IQR-trimmed, ...) without re-running inference. If a frame's β is wildly off, we'll see it in `betas_per_frame` before re-aggregating.
-
-- **`stage1_result.npz` is a small metadata bundle; pixel data stays at path references.** Mask PNGs and Sapiens normal .npzs are referenced by `mask_paths` / `normal_paths` rather than bundled inline. Saves ~150 MB per run, lets Stage 2 lazy-load per frame. Stage1Result round-trip is fast enough that the self-check runs on every invocation.
-
-- **Belt-and-suspenders round-trip self-check.** `_verify_round_trip` loads the just-written `stage1_result.npz` and asserts shape/dtype/value equality on every field. Cheap because the bundle is small. Marked in code as MVP-stage; likely gets a disable flag once Stage 1 stabilizes. For now it always runs.
-
-- **`bbox_source == "none"` gate after `extract_keypoints`.** If YOLOX fails on any frame, raise with the full list of offenders before SAM/hmr2 see a zero bbox. No silent fallback to a center-crop heuristic — that's the bug option (c) is fixing.
-
-**SAM regression and the root cause:**
-
-Option (c) caused a regression nobody predicted: frames 06 and 11 of `test.mp4` came out with *inverted* masks (green covering the background, body bare; SAM score ≈ 0.27). The user pushed back on my first instinct to defer this as "out of M6 scope" — it isn't; Stage 2's silhouette loss would optimize toward the background. Diagnosing properly:
-
-- Eyeball of all 12 overlays revealed the inversion (not a multimask ranking issue).
-- 3-score diagnostic falsified the multimask-split hypothesis: on the inverted frames, **all three SAM candidates scored below 0.30**. There was no good candidate to re-pick.
-- Pattern: very wide YOLOX bbox (>80% of image width) + person occupying a narrow vertical strip inside the box (spread arms, lots of background visible left-and-right) → SAM can't tell whether "the foreground object" is the person or the bracketed background region. The keypoint-derived bbox M5 used for `refine_masks_with_keypoints` was tighter (10% pad on joints only), which never triggered this ambiguity. Option (c)'s shared YOLOX bbox is *looser* by design — YOLOX wraps the whole person silhouette including outstretched limbs.
-
-**Fix:** keep option (c) at the SMPL boundary but enrich SAM's prompt with positive-point torso anchors from RTMPose. Combined `box + point_coords + point_labels=ones`. Filtered torso indices (0, 5, 6, 11, 12), score gate at 0.5, fail-loud if < 2 survive on any frame. Verified by source read against `sam2/sam2_image_predictor.py:237–303` before coding — point + box prompts are independent optional kwargs; `multimask_output=True` is supported with combined prompts. Re-ran end-to-end: all 12 frames now `score ∈ [0.938, 0.953]`, tight band, all 12 use 5 positive points (nose passed the 0.5 gate even on back views). Frames 06 and 11 visually corrected, no regression on the previously-clean six (02/03/04/08/09/10).
+**SAM regression (resolved):** Wide YOLOX bbox (>80% image width) + person in narrow vertical strip → SAM's three multimask candidates all scored < 0.30 with the argmax often inverted (frames 06, 11). Fix: combine box with positive torso-keypoint points (COCO 0/5/6/11/12, score gate 0.5, fail-loud if <2 survive). Post-fix all 12 frames score 0.938–0.953. Captured as PROJECT.md pitfall #8.
 
 **Surprises:**
+- **Sapiens-Normal magnitude outliers (6.42, 6.88) were downstream of the SAM inversion**, not a Sapiens artifact. `extract_normals` multiplies Sapiens output by mask; inverted mask zeroed the wrong region. After SAM fix: 1.07, 1.14. Generalization worth carrying: anomalies on the same frames often share an upstream cause.
+- **SAM score is not a per-frame mask quality signal.** Pre-fix, 4 visually-clean masks scored 0.40–0.54. Score reflects prompt-information sufficiency, not mask correctness. Stage 2's silhouette loss must NOT weight per-frame by SAM score.
 
-- **Sapiens-Normal outliers were downstream of the SAM inversion, not a Sapiens artifact.** On the first run, `normal_06.npz` and `normal_11.npz` had per-pixel magnitudes up to 6.42 / 6.88 (everything else ≤ 1.10). I'd queued this as a separate deferred-NOTES item — but after the SAM fix, those frames' max magnitudes dropped to 1.07 / 1.14 in the same band as the rest. Root cause: `extract_normals` multiplies Sapiens output by the mask. When the mask is inverted, "foreground" is actually background, where Sapiens' raw output isn't unit-magnitude. Useful generalization: when two unrelated-looking anomalies show up on the same frames, look for a common upstream cause before treating them as separate bugs. I called these "two separate issues" in my first analysis; they were one.
+**M7 must read — removed from `pipeline.run()`:**
+- `stage2.run()` and `stage3.run()` calls removed (M1 stubs). **M7 must wire `stage2.run()` back into `pipeline.run()`** after the optimization loop is implemented, taking Stage1Result as input.
 
-- **The `/tmp/matplotlib/` directory on this dev host.** A leftover from some prior pip scratch install. Caused the first smoke test to fail mysteriously: when Python runs `python /tmp/<script>.py`, sys.path[0] is `/tmp`, so `torchmetrics`' `RequirementCache("matplotlib")` saw the orphan directory and concluded matplotlib was available, then choked on the deeper `import matplotlib.axes`. Workaround: run from a clean directory (`/var/tmp/bodymvp-smoke/`). Not a project issue — host pollution. User cleans up separately. Worth knowing for any future "REPL acceptance from `/tmp`" instruction.
-
-- **Sub-task path Read tests revealed `Path` vs `PosixPath` subtlety.** On Linux, `pathlib.Path(...)` instantiates `PosixPath` (a `Path` subclass). My first smoke test used `type(p) is Path` which failed because the actual type is `PosixPath`. Fixed to `isinstance(p, Path) and not isinstance(p, str)`. Standard Python gotcha; recording so future-me doesn't relearn it on the next dataclass.
-
-- **Visual + score correlation isn't 1-to-1.** Even before the fix, 4 frames (00/01/05/07) had visually-clean masks but SAM scores in 0.40–0.54. Score is a confidence indicator, not a quality indicator — Stage 2 must not weight per-frame silhouette loss by SAM score. After the fix all 12 are in [0.938, 0.953] anyway, but the deeper point stands: score doesn't transfer cleanly to "trust the mask less".
-
-**Things removed from `pipeline.run()` that future-M7-me must restore:**
-
-- **`stage1.run()` (the M1 stub)** — replaced by the real wiring in `pipeline.run()`. Stub function still exists in `stage1.py`; nothing calls it.
-- **`stage2.run()` and `stage3.run()` calls** — these were M1 placeholders that logged "not implemented". Removed because M6's scope ends at Stage 1. **M7 must wire `stage2.run()` back into `pipeline.run()` after the optimization loop is implemented**, taking the `Stage1Result` we now produce as input.
-
-**Production-backlog items (don't act on now):**
-
-- If `box+points` still produces wrong masks on some future frame, try `multimask_output=False` (per SAM 2 docs for multi-prompt cases) *before* adding pipeline fallback chains. The fallback-chain road is where pipelines go to die.
-- The minimum-survival rule of `>= 2` torso points doesn't enforce point-pair geometry. If masks ever bias to upper or lower body, require `>= 1 shoulder AND >= 1 hip` among the surviving points.
-- SAM score is not a reliable per-frame quality signal under YOLOX-bbox+torso-points prompting. Stage 2 must treat masks as binary: mask exists, mask is trusted (because pipeline passed the inversion fix). Don't weight silhouette loss by SAM score.
-
-**Known upstream noise (not patching third_party):**
-
-- `hmr2/datasets/vitdet_dataset.py:62` has a stray `print(f'{downsampling_factor=}')` — 12 lines of stdout per run. Revisit only if it becomes a real annoyance.
+**Production backlog (don't act on now):**
+- If box+points ever fails on a future frame, try `multimask_output=False` (per SAM 2 docs for multi-prompt cases) before adding fallback chains.
+- `>= 2 torso points` rule doesn't enforce geometry. If masks ever bias upper/lower body, require `>= 1 shoulder AND >= 1 hip`.
+- See Surprises re: SAM score and Stage 2 silhouette weighting.
 
 **Open questions:**
+- `_MASK_COVERAGE_THRESHOLD` and `_MASK_REFINE_COVERAGE_THRESHOLD` are now unused by the pipeline. Add "no longer pipeline-called" comment on the next stage1.py drive-by.
+- Boxer-shorts pattern still segmented as background by SAM (M5 carryover, unchanged by box+points).
+- `hmr2/datasets/vitdet_dataset.py:62` stray `print(f'{downsampling_factor=}')` — don't patch third_party.
 
-- The pre-existing `_MASK_COVERAGE_THRESHOLD` and `_MASK_REFINE_COVERAGE_THRESHOLD` constants in `stage1.py` are now unused by the pipeline (their consumers — `_mask_to_bbox`, `refine_masks_with_keypoints` — are no longer called). User asked to leave them with a one-line "no longer pipeline-called" comment; I haven't added that comment yet. Small drive-by for the next stage1.py touch.
-- Boxer-shorts pattern is still segmented as background by SAM (visible as a green cutout inside the body in the overlays). Carryover from M5's notes; unchanged by M6's box+points prompt. Won't materially affect Stage 2.
-
-**Next:** M7 — Stage 2 minimal optimization. ΔV optimization loop with silhouette loss + a basic regularizer. Will need to wire `stage2.run()` back into `pipeline.run()`.
+**Next:** M7 — Stage 2 minimal optimization. ΔV loop + silhouette loss + basic regularizer. First task: wire `stage2.run()` back into `pipeline.run()`.
