@@ -1,10 +1,784 @@
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+import cv2
+import matplotlib
+matplotlib.use("Agg")  # headless; must precede pyplot import
+import matplotlib.pyplot as plt
+import numpy as np
+import smplx
+import smplx.lbs
+import torch
 from loguru import logger
+from pytorch3d.structures import Meshes
+
+from body_mvp.config import (
+    FACES_PER_PIXEL,
+    GRAD_CLIP_NORM,
+    LEARNING_RATE,
+    LOSS_WEIGHTS,
+    OPT_MAX_ITERS,
+    RENDER_RESOLUTION,
+    settings,
+)
+from body_mvp.losses import (
+    hard_iou_per_frame,
+    laplacian_smoothing_loss,
+    silhouette_iou_loss,
+)
+from body_mvp.render import build_cameras, build_silhouette_renderer
+from body_mvp.stage1 import Stage1Result
+
+# hmr2's training crop size. focal_length_per_frame in Stage1Result is in
+# this normalized space (typically 5000); render-resolution pixels need
+# `fl_render = fl_raw / _HMR2_CROP_SIZE * max(Wt, Ht)`. Mirrors hmr2's own
+# scaling in third_party/4D-Humans/hmr2/utils/renderer.py:render_rgba_multiple
+# and our M4 render_smpl_overlays (stage1.py:512).
+_HMR2_CROP_SIZE = 256
 
 
-def run() -> None:
-    logger.info("Stage 2 not implemented yet")
+@dataclass
+class Stage2Result:
+    """Aggregated output of Stage 2 minimal optimization (M7).
+
+    ΔV is the per-vertex offset learned in canonical T-pose space. β and θ
+    are passed through from Stage 1 unchanged — Stage 3 needs all three to
+    reconstruct posed and canonical meshes. Optimization metadata
+    (final_loss, loss_history, n_iterations) is kept alongside for
+    debugging and M8 tuning.
+
+    Persisted to a single .npz at the run dir root via save_stage2_result;
+    reload via load_stage2_result. Native numpy dtypes only, no pickle.
+    """
+
+    run_id: str
+    run_dir: Path
+
+    # ΔV — the optimized per-vertex offset in canonical T-pose space.
+    delta_v: np.ndarray              # [6890, 3] float32
+
+    # Pass-through from Stage 1 — Stage 3 consumes both to rebuild the mesh.
+    beta: np.ndarray                 # [10]      float32
+    theta_per_frame: np.ndarray      # [N, 24, 3] float32
+
+    # Optimization metadata.
+    n_iterations: int
+    final_loss: float
+    loss_history: np.ndarray         # [T] float32 — total loss per iter
+
+    # Quality bars per frame (silhouette IoU before/after).
+    initial_iou_per_frame: np.ndarray  # [N] float32
+    final_iou_per_frame: np.ndarray    # [N] float32
+
+    def __post_init__(self) -> None:
+        if self.n_iterations <= 0:
+            raise ValueError(f"n_iterations: must be > 0, got {self.n_iterations}")
+        if self.final_loss != self.final_loss:  # NaN
+            raise ValueError("final_loss: must not be NaN")
+
+        def _check_shape(name: str, arr: np.ndarray, expected: tuple) -> None:
+            if arr.shape != expected:
+                raise ValueError(
+                    f"{name}: expected shape {expected}, got {tuple(arr.shape)}"
+                )
+
+        _check_shape("delta_v", self.delta_v, (6890, 3))
+        _check_shape("beta", self.beta, (10,))
+
+        N = self.theta_per_frame.shape[0]
+        if N <= 0:
+            raise ValueError(f"theta_per_frame: leading dim must be > 0, got {N}")
+        _check_shape("theta_per_frame", self.theta_per_frame, (N, 24, 3))
+        _check_shape("initial_iou_per_frame", self.initial_iou_per_frame, (N,))
+        _check_shape("final_iou_per_frame", self.final_iou_per_frame, (N,))
+
+        T = self.loss_history.shape[0]
+        if T != self.n_iterations:
+            raise ValueError(
+                f"loss_history length {T} != n_iterations {self.n_iterations}"
+            )
 
 
-def optimize_vertex_offsets(*args, **kwargs):
-    """M7: TODO"""
-    raise NotImplementedError("M7")
+def save_stage2_result(result: Stage2Result, path: Path) -> None:
+    """Write Stage2Result to a single .npz at `path`. Mirrors save_stage1_result:
+    native dtypes, no pickle, strings as 0-d unicode arrays, paths as str."""
+    assert path.suffix == ".npz", (
+        f"save_stage2_result: path must end in .npz to match np.savez's own "
+        f"behavior (it silently appends .npz otherwise, desyncing the file "
+        f"path the caller thinks they wrote). Got: {path}"
+    )
+    np.savez(
+        str(path),
+        run_id=np.array(result.run_id),
+        run_dir=np.array(str(result.run_dir)),
+        delta_v=result.delta_v.astype(np.float32),
+        beta=result.beta.astype(np.float32),
+        theta_per_frame=result.theta_per_frame.astype(np.float32),
+        n_iterations=np.array(result.n_iterations, dtype=np.int64),
+        # float64 to preserve full Python-float precision through the
+        # round-trip self-check (single scalar, no memory cost). The
+        # array-typed loss_history stays float32 per plan.
+        final_loss=np.array(result.final_loss, dtype=np.float64),
+        loss_history=result.loss_history.astype(np.float32),
+        initial_iou_per_frame=result.initial_iou_per_frame.astype(np.float32),
+        final_iou_per_frame=result.final_iou_per_frame.astype(np.float32),
+    )
+
+
+def load_stage2_result(path: Path) -> Stage2Result:
+    """Inverse of save_stage2_result. allow_pickle=False is safe — every
+    field is stored as a native numpy dtype."""
+    data = np.load(str(path), allow_pickle=False)
+    return Stage2Result(
+        run_id=str(data["run_id"].item()),
+        run_dir=Path(str(data["run_dir"].item())),
+        delta_v=data["delta_v"],
+        beta=data["beta"],
+        theta_per_frame=data["theta_per_frame"],
+        n_iterations=int(data["n_iterations"].item()),
+        final_loss=float(data["final_loss"].item()),
+        loss_history=data["loss_history"],
+        initial_iou_per_frame=data["initial_iou_per_frame"],
+        final_iou_per_frame=data["final_iou_per_frame"],
+    )
+
+
+def _verify_stage2_round_trip(original: Stage2Result, path: Path) -> None:
+    """Load the just-written Stage2Result and fail-loud if anything drifted.
+
+    Same belt-and-suspenders pattern as Stage 1: cheap enough to run on
+    every save (no pixel data in the bundle).
+    """
+    loaded = load_stage2_result(path)
+
+    scalar_fields = ("run_id", "run_dir", "n_iterations", "final_loss")
+    for name in scalar_fields:
+        a = getattr(original, name)
+        b = getattr(loaded, name)
+        if a != b:
+            raise RuntimeError(
+                f"round-trip mismatch on {name}: original={a!r} loaded={b!r}"
+            )
+
+    array_fields = (
+        "delta_v", "beta", "theta_per_frame", "loss_history",
+        "initial_iou_per_frame", "final_iou_per_frame",
+    )
+    for name in array_fields:
+        a = getattr(original, name)
+        b = getattr(loaded, name)
+        if a.shape != b.shape:
+            raise RuntimeError(f"round-trip shape mismatch on {name}: {a.shape} vs {b.shape}")
+        if a.dtype != b.dtype:
+            raise RuntimeError(f"round-trip dtype mismatch on {name}: {a.dtype} vs {b.dtype}")
+        if not np.array_equal(a, b):
+            raise RuntimeError(f"round-trip value mismatch on {name}")
+
+    logger.info("stage2_result.npz round-trip self-check passed")
+
+
+def _load_smpl_model(device: str) -> smplx.SMPL:
+    """Load smplx.SMPL from the symlinked checkpoint (basicModel_*.pkl).
+
+    create_*=False suppresses smplx's default nn.Parameter allocations for
+    inputs we feed manually (β, pose, transl). The model's buffers
+    (v_template, shapedirs, posedirs, J_regressor, lbs_weights, parents,
+    faces) are byte-identical to what hmr2 loaded in Stage 1.
+    """
+    model = smplx.SMPL(
+        model_path=str(settings.smpl_model_path),
+        gender="neutral",
+        num_betas=10,
+        create_betas=False,
+        create_global_orient=False,
+        create_body_pose=False,
+        create_transl=False,
+    ).to(device).eval()
+    return model
+
+
+def _pose_meshes(
+    smpl_model: smplx.SMPL,
+    beta: torch.Tensor,          # [10]      float, requires_grad=False
+    theta: torch.Tensor,         # [N, 24, 3] float, axis-angle, requires_grad=False
+    delta_v: torch.Tensor,       # [6890, 3] float, requires_grad=True (or zeros for sanity)
+    pred_cam_t: torch.Tensor,    # [N, 3]    float (full-image translation from hmr2)
+    device: str,
+) -> Meshes:
+    """β-shape + ΔV applied in canonical T-pose space, then LBS-posed per
+    frame, then SMPL→OpenCV-camera flip applied.
+
+    Gradient flow: ΔV → v_canonical → v_template (into smplx.lbs.lbs) →
+    skinned verts → Meshes. β/θ/pred_cam_t are detached upstream.
+    """
+    N = theta.shape[0]
+
+    # Step 1: apply shape blendshapes once (β is shared across all N frames).
+    # v_canonical: [6890, 3] = template + Σ(β_k * shapedir_k) + ΔV.
+    v_shape_only = smplx.lbs.blend_shapes(
+        beta.unsqueeze(0), smpl_model.shapedirs
+    ).squeeze(0)
+    v_canonical = smpl_model.v_template + v_shape_only + delta_v  # [6890, 3]
+
+    # Step 2: batch the canonical mesh across N frames as a *per-frame*
+    # v_template input to smplx.lbs.lbs. Passing betas=zeros there makes
+    # its internal `v_shaped = v_template + blend_shapes(0)` collapse to
+    # v_template, so blend_shapes is applied exactly once (above) — no
+    # double-counting.
+    v_template_batched = v_canonical.unsqueeze(0).expand(N, -1, -1).contiguous()
+    pose_batched = theta.reshape(N, 72)  # [N, 24*3] axis-angle
+    betas_zero = torch.zeros(N, 10, device=device, dtype=beta.dtype)
+
+    # Step 3: LBS. Pose blendshapes (posedirs @ (R_j - I)) are still applied
+    # internally on top of v_template; they're independent of β.
+    verts_posed, _joints = smplx.lbs.lbs(
+        betas=betas_zero,
+        pose=pose_batched,
+        v_template=v_template_batched,
+        shapedirs=smpl_model.shapedirs,
+        posedirs=smpl_model.posedirs,
+        J_regressor=smpl_model.J_regressor,
+        parents=smpl_model.parents,
+        lbs_weights=smpl_model.lbs_weights,
+        pose2rot=True,
+    )  # [N, 6890, 3]
+
+    # Step 4: add hmr2's full-image translation. NO additional flip is
+    # needed, despite hmr2's pyrender path applying a 180° X rotation.
+    #
+    # Counterintuitive but verified empirically (named SMPL vertices
+    # projected vs M4 overlay measurement): hmr2's predicted global_orient
+    # already encodes a ~180° X rotation (|θ_0| ≈ 3.105 rad on our test
+    # video, all 12 frames). The posed SMPL therefore has head at NEGATIVE
+    # Y and feet at POSITIVE Y — already in OpenCV image convention
+    # (Y-down). hmr2's R_180x in the pyrender renderer plus pyrender's
+    # OpenGL Y-up framebuffer flip together CANCEL with the global_orient's
+    # built-in flip, so applying any further flip here would invert the
+    # image relative to M4.
+    #
+    # Verified vertex 411 (head crown): SMPL canonical y=+0.555, posed
+    # y=-1.001 (global_orient flips), after +cam_t y=-0.598. PyTorch3D
+    # OpenCV projection v = fy*Y/Z + cy = 37500 * (-0.598) / 51.37 + 960
+    # ≈ 524, matching M4's measured head y_top=512.
+    verts_world = verts_posed + pred_cam_t.unsqueeze(1)  # [N, 6890, 3]
+
+    # Step 5: wrap as a batched PyTorch3D Meshes.
+    faces_np = smpl_model.faces.astype(np.int64)
+    faces = torch.from_numpy(faces_np).to(device)
+    faces_batched = faces.unsqueeze(0).expand(N, -1, -1)
+    return Meshes(verts=verts_world, faces=faces_batched)
+
+
+def _compute_render_resolution(W_orig: int, H_orig: int) -> tuple[int, int, float]:
+    """Render at long-side = RENDER_RESOLUTION, preserving aspect ratio.
+
+    Returns (Ht, Wt, scale). scale = Wt/W_orig = Ht/H_orig.
+    """
+    if W_orig >= H_orig:
+        Wt = RENDER_RESOLUTION
+        Ht = int(round(H_orig * Wt / W_orig))
+    else:
+        Ht = RENDER_RESOLUTION
+        Wt = int(round(W_orig * Ht / H_orig))
+    scale = Wt / W_orig
+    return Ht, Wt, scale
+
+
+def _silhouette_triptych(
+    keyframe_bgr: np.ndarray,    # [H_orig, W_orig, 3] BGR
+    mask_small: np.ndarray,      # [Ht, Wt] uint8 0/255
+    alpha_np: np.ndarray,        # [Ht, Wt] float in [0, 1]
+    Wt: int,
+    Ht: int,
+    label: str,
+) -> np.ndarray:
+    """Build the keyframe | (kf+green-silhouette+red-mask-contour) | alpha
+    triptych. Returns a [Ht, 3*Wt, 3] BGR uint8 image."""
+    kf_resized = cv2.resize(keyframe_bgr, (Wt, Ht), interpolation=cv2.INTER_AREA)
+
+    panel_kf = kf_resized.copy()
+
+    panel_overlay = kf_resized.astype(np.float32)
+    silh_green = np.zeros_like(panel_overlay)
+    silh_green[..., 1] = 220.0  # BGR green
+    a3 = alpha_np[..., None]
+    panel_overlay = panel_overlay * (1.0 - a3 * 0.55) + silh_green * (a3 * 0.55)
+    contours, _ = cv2.findContours(
+        (mask_small > 127).astype(np.uint8),
+        cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+    )
+    panel_overlay = panel_overlay.astype(np.uint8)
+    cv2.drawContours(panel_overlay, contours, -1, (0, 0, 255), 2)
+
+    panel_alpha = np.clip(alpha_np * 255.0, 0, 255).astype(np.uint8)
+    panel_alpha = cv2.cvtColor(panel_alpha, cv2.COLOR_GRAY2BGR)
+
+    triptych = cv2.hconcat([panel_kf, panel_overlay, panel_alpha])
+    cv2.putText(
+        triptych, label, (8, 18),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA,
+    )
+    return triptych
+
+
+def sanity_render_frame00(stage1_result: Stage1Result) -> Path:
+    """Step-1 hard gate: render initial SMPL (ΔV=0) silhouette for frame 0,
+    overlay against keyframe and SAM mask, print initial IoU. Caller (the
+    user) inspects the overlay visually before any further M7 work.
+    """
+    device = settings.device
+
+    kf_path = stage1_result.keyframe_paths[0]
+    mask_path = stage1_result.mask_paths[0]
+    keyframe_bgr = cv2.imread(str(kf_path))
+    if keyframe_bgr is None:
+        raise RuntimeError(f"Could not read keyframe: {kf_path}")
+    H_orig, W_orig = keyframe_bgr.shape[:2]
+
+    Ht, Wt, scale = _compute_render_resolution(W_orig, H_orig)
+    logger.info(
+        "Sanity render frame 0: keyframe={}x{}, render={}x{}, scale={:.4f}",
+        W_orig, H_orig, Wt, Ht, scale,
+    )
+
+    smpl_model = _load_smpl_model(device)
+    logger.info("SMPL loaded from {}", settings.smpl_model_path)
+
+    beta = torch.from_numpy(stage1_result.beta).to(device).float()
+    theta_0 = torch.from_numpy(stage1_result.theta_per_frame[0:1]).to(device).float()
+    cam_t_0 = torch.from_numpy(stage1_result.pred_cam_t_per_frame[0:1]).to(device).float()
+    fl_orig_0 = float(stage1_result.focal_length_per_frame[0])
+
+    delta_v = torch.zeros(6890, 3, device=device)
+
+    with torch.no_grad():
+        meshes = _pose_meshes(smpl_model, beta, theta_0, delta_v, cam_t_0, device)
+        fl_render_val = fl_orig_0 / _HMR2_CROP_SIZE * max(Wt, Ht)
+        fl_render = torch.tensor([fl_render_val], device=device)
+        cameras = build_cameras(fl_render, (Ht, Wt), device)
+        renderer = build_silhouette_renderer(cameras, (Ht, Wt), FACES_PER_PIXEL)
+        images = renderer(meshes)            # [1, Ht, Wt, 4]
+        alpha = images[..., 3]               # [1, Ht, Wt] in [0, 1]
+
+    mask_full = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+    if mask_full is None:
+        raise RuntimeError(f"Could not read mask: {mask_path}")
+    mask_small = cv2.resize(mask_full, (Wt, Ht), interpolation=cv2.INTER_NEAREST)
+    mask_tensor = torch.from_numpy((mask_small > 127).astype(np.float32)).unsqueeze(0).to(device)
+
+    pred_binary = (alpha > 0.5).float()
+    iou_frame0 = float(hard_iou_per_frame(pred_binary, mask_tensor).item())
+    coverage_pred = float(pred_binary.mean().item())
+    coverage_target = float(mask_tensor.mean().item())
+    logger.info(
+        "Frame 00 initial (ΔV=0): IoU={:.4f}, pred_coverage={:.4f}, "
+        "target_coverage={:.4f}",
+        iou_frame0, coverage_pred, coverage_target,
+    )
+
+    alpha_np = alpha[0].detach().cpu().numpy()
+    label = (
+        f"frame 00 | render {Wt}x{Ht} | initial IoU={iou_frame0:.3f} "
+        f"| green=SMPL alpha | red=SAM mask outline"
+    )
+    triptych = _silhouette_triptych(keyframe_bgr, mask_small, alpha_np, Wt, Ht, label)
+
+    out_dir = stage1_result.run_dir / "stage2"
+    out_dir.mkdir(exist_ok=True)
+    out_path = out_dir / "sanity_frame00.png"
+    cv2.imwrite(str(out_path), triptych)
+    logger.info("Wrote {}", out_path)
+    return out_path
+
+
+def sanity_render_all_frames(stage1_result: Stage1Result) -> list[Path]:
+    """Step-2: batched _pose_meshes + per-frame silhouette render over all
+    N keyframes. Logs per-frame initial IoU + the mean, and saves a
+    triptych overlay per frame.
+
+    Same camera math as sanity_render_frame00 but batched. Verifies the
+    LBS path works for every theta (not just frame 0) and surfaces any
+    frame whose silhouette is grossly misplaced (which would signal a
+    camera-path issue that needs revisiting before optimization).
+    """
+    device = settings.device
+    N = stage1_result.n_frames
+
+    # All keyframes share size (asserted by pipeline._assert_consistent_keyframe_size).
+    W_orig, H_orig = stage1_result.image_size_wh
+    Ht, Wt, scale = _compute_render_resolution(W_orig, H_orig)
+    logger.info(
+        "Sanity render all frames: N={}, keyframe={}x{}, render={}x{}",
+        N, W_orig, H_orig, Wt, Ht,
+    )
+
+    smpl_model = _load_smpl_model(device)
+    logger.info("SMPL loaded from {}", settings.smpl_model_path)
+
+    beta = torch.from_numpy(stage1_result.beta).to(device).float()
+    theta = torch.from_numpy(stage1_result.theta_per_frame).to(device).float()        # [N, 24, 3]
+    cam_t = torch.from_numpy(stage1_result.pred_cam_t_per_frame).to(device).float()   # [N, 3]
+    fl_orig = torch.from_numpy(stage1_result.focal_length_per_frame).to(device).float()  # [N]
+    delta_v = torch.zeros(6890, 3, device=device)
+
+    with torch.no_grad():
+        meshes = _pose_meshes(smpl_model, beta, theta, delta_v, cam_t, device)
+
+        fl_render = fl_orig / _HMR2_CROP_SIZE * max(Wt, Ht)                            # [N]
+        cameras = build_cameras(fl_render, (Ht, Wt), device)
+        renderer = build_silhouette_renderer(cameras, (Ht, Wt), FACES_PER_PIXEL)
+
+        images = renderer(meshes)            # [N, Ht, Wt, 4]
+        alpha = images[..., 3]               # [N, Ht, Wt]
+
+    # Target masks at render resolution.
+    mask_imgs: list[np.ndarray] = []         # [Ht, Wt] uint8 0/255
+    for mp in stage1_result.mask_paths:
+        m = cv2.imread(str(mp), cv2.IMREAD_GRAYSCALE)
+        if m is None:
+            raise RuntimeError(f"Could not read mask: {mp}")
+        mask_imgs.append(cv2.resize(m, (Wt, Ht), interpolation=cv2.INTER_NEAREST))
+    mask_stack = np.stack([(m > 127).astype(np.float32) for m in mask_imgs])           # [N, Ht, Wt]
+    mask_tensor = torch.from_numpy(mask_stack).to(device)
+
+    pred_binary = (alpha > 0.5).float()
+    iou_per_frame = hard_iou_per_frame(pred_binary, mask_tensor).cpu().numpy()         # [N]
+    mean_iou = float(iou_per_frame.mean())
+
+    out_dir = stage1_result.run_dir / "stage2"
+    out_dir.mkdir(exist_ok=True)
+    out_paths: list[Path] = []
+    alpha_np_all = alpha.detach().cpu().numpy()                                        # [N, Ht, Wt]
+
+    logger.info("Per-frame initial IoU (ΔV=0):")
+    for i in range(N):
+        idx = stage1_result.keyframe_paths[i].stem.split("_")[-1]
+        kf_bgr = cv2.imread(str(stage1_result.keyframe_paths[i]))
+        if kf_bgr is None:
+            raise RuntimeError(f"Could not read keyframe: {stage1_result.keyframe_paths[i]}")
+        iou_i = float(iou_per_frame[i])
+        cov_pred = float(pred_binary[i].mean().item())
+        cov_tgt = float(mask_tensor[i].mean().item())
+        logger.info(
+            "  frame {}: IoU={:.4f}  pred_cov={:.4f}  tgt_cov={:.4f}",
+            idx, iou_i, cov_pred, cov_tgt,
+        )
+        label = f"frame {idx} | initial IoU={iou_i:.3f} | green=SMPL alpha | red=SAM mask"
+        triptych = _silhouette_triptych(
+            kf_bgr, mask_imgs[i], alpha_np_all[i], Wt, Ht, label,
+        )
+        out_path = out_dir / f"sanity_frame_{idx}.png"
+        cv2.imwrite(str(out_path), triptych)
+        out_paths.append(out_path)
+
+    logger.info(
+        "Mean initial IoU across {} frames: {:.4f} (min={:.4f}, max={:.4f})",
+        N, mean_iou, float(iou_per_frame.min()), float(iou_per_frame.max()),
+    )
+    return out_paths
+
+
+def run(stage1_result: Stage1Result) -> Stage2Result:
+    """M7 Stage 2 entry point. Optimizes ΔV against Stage 1's masks,
+    persists Stage2Result + loss_curve.png + per-frame overlays, runs the
+    round-trip self-check, returns the result. Mirrors stage1.run's
+    fail-loud persistence pattern.
+    """
+    out_dir = stage1_result.run_dir / "stage2"
+    out_dir.mkdir(exist_ok=True)
+    loss_curve_path = out_dir / "loss_curve.png"
+
+    result = optimize_vertex_offsets(
+        stage1_result, loss_curve_path=loss_curve_path,
+    )
+
+    npz_path = stage1_result.run_dir / "stage2_result.npz"
+    save_stage2_result(result, npz_path)
+    logger.info("Wrote {}", npz_path)
+    _verify_stage2_round_trip(result, npz_path)
+
+    logger.info("Stage 2 complete: run_id={}", result.run_id)
+    return result
+
+
+def _load_target_masks(
+    stage1_result: Stage1Result, render_hw: tuple[int, int], device: str
+) -> torch.Tensor:
+    """Load SAM masks from disk, resize NEAREST to render_hw, return as
+    [N, Ht, Wt] float32 tensor in {0, 1} on device."""
+    Ht, Wt = render_hw
+    stack = np.zeros((stage1_result.n_frames, Ht, Wt), dtype=np.float32)
+    for i, mp in enumerate(stage1_result.mask_paths):
+        m = cv2.imread(str(mp), cv2.IMREAD_GRAYSCALE)
+        if m is None:
+            raise RuntimeError(f"Could not read mask: {mp}")
+        m_small = cv2.resize(m, (Wt, Ht), interpolation=cv2.INTER_NEAREST)
+        stack[i] = (m_small > 127).astype(np.float32)
+    return torch.from_numpy(stack).to(device)
+
+
+def optimize_vertex_offsets(
+    stage1_result: Stage1Result,
+    loss_curve_path: Path | None = None,
+) -> Stage2Result:
+    """M7 minimal: optimize per-vertex offset ΔV in canonical T-pose space
+    against the N keyframe SAM masks via differentiable silhouette
+    rendering + uniform Laplacian smoothing.
+
+    Knobs (config.py): LEARNING_RATE=1e-3, OPT_MAX_ITERS=200,
+    GRAD_CLIP_NORM=1.0, LOSS_WEIGHTS["silhouette"]=1.0,
+    LOSS_WEIGHTS["laplacian"]=100.0, FACES_PER_PIXEL=25,
+    RENDER_RESOLUTION=256.
+
+    No LR schedule, no early stop, no recovery branches. The grad-clip
+    plus the conservative LR is the entire defense against pitfall #3
+    (Stage 2 explosions).
+
+    If `loss_curve_path` is provided, writes a 3-line loss curve PNG to
+    that location (total + silhouette + 100·laplacian vs iter). The
+    silh/lap per-iter histories live only in this function's local scope
+    — they're NOT in Stage2Result by design, so the plot has to be
+    emitted here.
+    """
+    device = settings.device
+    N = stage1_result.n_frames
+
+    is_cuda = device.startswith("cuda")
+    if is_cuda:
+        torch.cuda.reset_peak_memory_stats()  # defaults to current device
+    t0 = time.perf_counter()
+
+    # --- Setup ---
+    W_orig, H_orig = stage1_result.image_size_wh
+    Ht, Wt, _scale = _compute_render_resolution(W_orig, H_orig)
+    logger.info(
+        "Stage 2 setup: N={}, render={}x{}, lr={}, iters={}, "
+        "w_silh={}, w_lap={}, grad_clip={}",
+        N, Wt, Ht, LEARNING_RATE, OPT_MAX_ITERS,
+        LOSS_WEIGHTS["silhouette"], LOSS_WEIGHTS["laplacian"], GRAD_CLIP_NORM,
+    )
+
+    smpl_model = _load_smpl_model(device)
+
+    # Detached pass-through tensors from Stage 1. torch.from_numpy + .to()
+    # produces requires_grad=False by default, but make it explicit so a
+    # future reader doesn't have to ask.
+    beta = torch.from_numpy(stage1_result.beta).to(device).float().requires_grad_(False)
+    theta = torch.from_numpy(stage1_result.theta_per_frame).to(device).float().requires_grad_(False)
+    cam_t = torch.from_numpy(stage1_result.pred_cam_t_per_frame).to(device).float().requires_grad_(False)
+    fl_orig = torch.from_numpy(stage1_result.focal_length_per_frame).to(device).float()
+
+    fl_render = fl_orig / _HMR2_CROP_SIZE * max(Wt, Ht)
+    cameras = build_cameras(fl_render, (Ht, Wt), device)
+    renderer = build_silhouette_renderer(cameras, (Ht, Wt), FACES_PER_PIXEL)
+    target_masks = _load_target_masks(stage1_result, (Ht, Wt), device)  # [N, Ht, Wt]
+
+    # ΔV — the only optimization variable.
+    delta_v = torch.nn.Parameter(torch.zeros(6890, 3, device=device, dtype=torch.float32))
+    optimizer = torch.optim.Adam([delta_v], lr=LEARNING_RATE)
+
+    # --- Initial IoU (ΔV=0) ---
+    with torch.no_grad():
+        meshes0 = _pose_meshes(smpl_model, beta, theta, delta_v, cam_t, device)
+        alpha0 = renderer(meshes0)[..., 3]
+        initial_iou = hard_iou_per_frame((alpha0 > 0.5).float(), target_masks).cpu().numpy()
+    logger.info(
+        "Initial mean IoU (ΔV=0): {:.4f} (min={:.4f}, max={:.4f})",
+        float(initial_iou.mean()), float(initial_iou.min()), float(initial_iou.max()),
+    )
+
+    # --- Optimization loop ---
+    loss_history: list[float] = []
+    silh_history: list[float] = []   # raw silhouette IoU loss (pre-weighting)
+    lap_history: list[float] = []    # raw uniform-Laplacian loss (pre-weighting)
+    LOG_EVERY = 10
+
+    w_silh = float(LOSS_WEIGHTS["silhouette"])
+    w_lap = float(LOSS_WEIGHTS["laplacian"])
+
+    for it in range(OPT_MAX_ITERS):
+        optimizer.zero_grad()
+
+        meshes = _pose_meshes(smpl_model, beta, theta, delta_v, cam_t, device)
+        alpha = renderer(meshes)[..., 3]                 # [N, Ht, Wt]
+
+        L_silh = silhouette_iou_loss(alpha, target_masks)
+        L_lap = laplacian_smoothing_loss(meshes)
+        L = w_silh * L_silh + w_lap * L_lap
+
+        L.backward()
+        torch.nn.utils.clip_grad_norm_([delta_v], max_norm=GRAD_CLIP_NORM)
+        optimizer.step()
+
+        loss_history.append(float(L.item()))
+        silh_history.append(float(L_silh.item()))
+        lap_history.append(float(L_lap.item()))
+        if it % LOG_EVERY == 0 or it == OPT_MAX_ITERS - 1:
+            logger.info(
+                "iter {:3d}: L={:.5f}  silh={:.5f}  lap={:.5f}  "
+                "|ΔV|_max={:.5f}",
+                it, float(L.item()), float(L_silh.item()), float(L_lap.item()),
+                float(delta_v.detach().abs().max().item()),
+            )
+
+    # --- Final IoU + bookkeeping ---
+    with torch.no_grad():
+        meshes_f = _pose_meshes(smpl_model, beta, theta, delta_v, cam_t, device)
+        alpha_f = renderer(meshes_f)[..., 3]
+        final_iou = hard_iou_per_frame((alpha_f > 0.5).float(), target_masks).cpu().numpy()
+
+    elapsed = time.perf_counter() - t0
+    peak_vram = (
+        torch.cuda.max_memory_allocated() / 1024**3 if is_cuda else float("nan")
+    )
+
+    delta_v_final = delta_v.detach().cpu().numpy().astype(np.float32)
+    max_abs_dv = float(np.abs(delta_v_final).max())
+    logger.info(
+        "Stage 2 done: final mean IoU={:.4f} (init={:.4f}, Δ={:+.4f}), "
+        "max|ΔV|={:.5f}, wall={:.1f}s, peak_VRAM={:.2f} GB",
+        float(final_iou.mean()), float(initial_iou.mean()),
+        float(final_iou.mean() - initial_iou.mean()),
+        max_abs_dv, elapsed, peak_vram,
+    )
+
+    # --- Loss curve (optional) ---
+    # Persisted only if caller provides a path. silh/lap histories are
+    # local-scope — Stage2Result.loss_history is just the total — so the
+    # plot must be emitted here. M8 will likely add more loss components,
+    # at which point this becomes the natural place to extend.
+    if loss_curve_path is not None:
+        iters = np.arange(OPT_MAX_ITERS)
+        total_arr = np.array(loss_history, dtype=np.float32)
+        silh_arr = np.array(silh_history, dtype=np.float32)
+        lap_weighted_arr = w_lap * np.array(lap_history, dtype=np.float32)
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.plot(iters, total_arr, label="total", linewidth=2.0, color="black")
+        ax.plot(iters, silh_arr, label="silhouette (w=1)", linewidth=1.2, color="tab:blue")
+        ax.plot(
+            iters, lap_weighted_arr,
+            label=f"laplacian (w={int(w_lap)})", linewidth=1.2, color="tab:orange",
+        )
+        ax.set_xlabel("iteration")
+        ax.set_ylabel("loss")
+        ax.set_title(
+            f"Stage 2 loss curve (lr={LEARNING_RATE}, iters={OPT_MAX_ITERS}, "
+            f"grad_clip={GRAD_CLIP_NORM})"
+        )
+        ax.legend(loc="upper right")
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(str(loss_curve_path), dpi=120)
+        plt.close(fig)
+        logger.info("Wrote loss curve to {}", loss_curve_path)
+
+    return Stage2Result(
+        run_id=stage1_result.run_id,
+        run_dir=stage1_result.run_dir,
+        delta_v=delta_v_final,
+        beta=stage1_result.beta.astype(np.float32),
+        theta_per_frame=stage1_result.theta_per_frame.astype(np.float32),
+        n_iterations=OPT_MAX_ITERS,
+        final_loss=loss_history[-1],
+        loss_history=np.array(loss_history, dtype=np.float32),
+        initial_iou_per_frame=initial_iou.astype(np.float32),
+        final_iou_per_frame=final_iou.astype(np.float32),
+    )
+
+
+def save_silhouette_debug(
+    stage1_result: Stage1Result,
+    stage2_result: Stage2Result,
+    out_dir: Path | None = None,
+) -> tuple[list[Path], list[Path]]:
+    """Persist per-frame init/final silhouette overlay triptychs to disk.
+
+    Self-contained: re-renders BOTH the ΔV=0 baseline and the optimized
+    ΔV state with two batched forward passes. Does NOT depend on
+    sanity_render_all_frames having been called first — pipeline.run
+    can invoke this directly after optimize_vertex_offsets.
+
+    The IoU values labeled on each frame come from
+    stage2_result.initial_iou_per_frame / final_iou_per_frame so the
+    triptych labels stay in lock-step with the stored result.
+
+    Same 3-panel format as the sanity overlays: keyframe / keyframe +
+    green SMPL silhouette + red SAM mask outline / silhouette alpha alone.
+    """
+    device = settings.device
+    N = stage1_result.n_frames
+
+    if out_dir is None:
+        out_dir = stage1_result.run_dir / "stage2"
+    out_dir.mkdir(exist_ok=True)
+
+    W_orig, H_orig = stage1_result.image_size_wh
+    Ht, Wt, _scale = _compute_render_resolution(W_orig, H_orig)
+
+    # Single setup, two forward passes (init + final). Sub-second total
+    # for N=12 at 144x256.
+    smpl_model = _load_smpl_model(device)
+    beta = torch.from_numpy(stage1_result.beta).to(device).float()
+    theta = torch.from_numpy(stage1_result.theta_per_frame).to(device).float()
+    cam_t = torch.from_numpy(stage1_result.pred_cam_t_per_frame).to(device).float()
+    fl_orig = torch.from_numpy(stage1_result.focal_length_per_frame).to(device).float()
+    fl_render = fl_orig / _HMR2_CROP_SIZE * max(Wt, Ht)
+
+    cameras = build_cameras(fl_render, (Ht, Wt), device)
+    renderer = build_silhouette_renderer(cameras, (Ht, Wt), FACES_PER_PIXEL)
+
+    delta_v_init = torch.zeros(6890, 3, device=device)
+    delta_v_final = torch.from_numpy(stage2_result.delta_v).to(device).float()
+
+    with torch.no_grad():
+        meshes_init = _pose_meshes(smpl_model, beta, theta, delta_v_init, cam_t, device)
+        alpha_init = renderer(meshes_init)[..., 3].cpu().numpy()    # [N, Ht, Wt]
+        meshes_final = _pose_meshes(smpl_model, beta, theta, delta_v_final, cam_t, device)
+        alpha_final = renderer(meshes_final)[..., 3].cpu().numpy()
+
+    init_paths: list[Path] = []
+    final_paths: list[Path] = []
+    for i, (kf_path, mp) in enumerate(
+        zip(stage1_result.keyframe_paths, stage1_result.mask_paths)
+    ):
+        idx = kf_path.stem.split("_")[-1]
+        kf_bgr = cv2.imread(str(kf_path))
+        if kf_bgr is None:
+            raise RuntimeError(f"Could not read keyframe: {kf_path}")
+        mask_full = cv2.imread(str(mp), cv2.IMREAD_GRAYSCALE)
+        if mask_full is None:
+            raise RuntimeError(f"Could not read mask: {mp}")
+        mask_small = cv2.resize(mask_full, (Wt, Ht), interpolation=cv2.INTER_NEAREST)
+
+        init_iou = float(stage2_result.initial_iou_per_frame[i])
+        final_iou = float(stage2_result.final_iou_per_frame[i])
+        init_label = (
+            f"frame {idx} | initial IoU={init_iou:.3f} | "
+            f"green=SMPL alpha | red=SAM mask"
+        )
+        final_label = (
+            f"frame {idx} | final IoU={final_iou:.3f} | "
+            f"green=SMPL alpha | red=SAM mask"
+        )
+
+        init_triptych = _silhouette_triptych(
+            kf_bgr, mask_small, alpha_init[i], Wt, Ht, init_label,
+        )
+        final_triptych = _silhouette_triptych(
+            kf_bgr, mask_small, alpha_final[i], Wt, Ht, final_label,
+        )
+
+        init_out = out_dir / f"overlay_init_{idx}.png"
+        final_out = out_dir / f"overlay_final_{idx}.png"
+        cv2.imwrite(str(init_out), init_triptych)
+        cv2.imwrite(str(final_out), final_triptych)
+        init_paths.append(init_out)
+        final_paths.append(final_out)
+
+    logger.info(
+        "Saved {} init + {} final overlays to {}",
+        len(init_paths), len(final_paths), out_dir,
+    )
+    return init_paths, final_paths

@@ -28,8 +28,10 @@ settings = Settings()
 # Algorithm constants — not deployment config, intentionally not in .env
 NUM_KEYFRAMES: int = 12
 OPT_MAX_ITERS: int = 200
-LEARNING_RATE: float = 5e-3
-RENDER_RESOLUTION: int = 512
+LEARNING_RATE: float = 1e-3       # M7 initial; revisit in M8
+GRAD_CLIP_NORM: float = 1.0       # M7 defense vs. pitfall #3 explosions
+RENDER_RESOLUTION: int = 256      # long side; M7 minimal silhouette opt
+FACES_PER_PIXEL: int = 25         # SoftSilhouetteShader fragment depth
 LOSS_WEIGHTS: dict[str, float] = {
     "silhouette": 1.0,
     "normal": 0.5,

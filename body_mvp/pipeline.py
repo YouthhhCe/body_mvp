@@ -9,6 +9,7 @@ from loguru import logger
 from body_mvp import stage1, stage2, stage3
 from body_mvp.config import NUM_KEYFRAMES, settings
 from body_mvp.stage1 import Stage1Result
+from body_mvp.stage2 import Stage2Result
 
 
 def _create_run_dir(run_id: str) -> Path:
@@ -215,7 +216,9 @@ def _verify_round_trip(original: Stage1Result, path: Path) -> None:
     logger.info("stage1_result.npz round-trip self-check passed")
 
 
-def run(video_path: Path, height: float, weight: float, gender: str) -> Stage1Result:
+def run(
+    video_path: Path, height: float, weight: float, gender: str
+) -> tuple[Stage1Result, Stage2Result]:
     now = datetime.now()
     run_id = now.strftime("%Y%m%d_%H%M%S")
     run_dir = _create_run_dir(run_id)
@@ -325,4 +328,14 @@ def run(video_path: Path, height: float, weight: float, gender: str) -> Stage1Re
     _verify_round_trip(result, out_path)
 
     logger.info("Stage 1 complete: run_id={}, n_frames={}", run_id, n_frames)
-    return result
+
+    # Stage 2: ΔV optimization against masks. stage2.run does the
+    # optimization + persists Stage2Result + runs its own round-trip check.
+    stage2_result = stage2.run(result)
+
+    # Debug viz: per-frame init/final silhouette overlays.
+    # save_silhouette_debug is self-contained (re-renders both states);
+    # depends only on Stage1Result + Stage2Result.
+    stage2.save_silhouette_debug(result, stage2_result)
+
+    return result, stage2_result
