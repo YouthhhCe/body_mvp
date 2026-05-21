@@ -17,7 +17,15 @@ def main(video_path: Path, height: float, weight: float, gender: str) -> None:
     """Reconstruct a 3D body mesh from a spinning video."""
     logger.remove()
     logger.add(lambda msg: click.echo(msg, err=True), level=settings.log_level, colorize=True)
-    pipeline.run(video_path, height, weight, gender)
+    result = pipeline.run(video_path, height, weight, gender)
+
+    beta_str = "[" + ", ".join(f"{x:.3f}" for x in result.beta) + "]"
+    logger.info("Stage 1 result:")
+    logger.info("  run_dir: {}", result.run_dir)
+    logger.info("  n_frames: {}", result.n_frames)
+    logger.info("  image_size_wh: {}", result.image_size_wh)
+    logger.info("  stage1_result.npz: {}", result.run_dir / "stage1_result.npz")
+    logger.info("  aggregated β (mean across keyframes): {}", beta_str)
 
 
 if __name__ == "__main__":

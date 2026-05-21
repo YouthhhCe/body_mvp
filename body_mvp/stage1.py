@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -18,6 +19,20 @@ from body_mvp.config import settings
 
 # Paired with checkpoints/sam2/sam2.1_hiera_small.pt
 _SAM2_CONFIG = "configs/sam2.1/sam2.1_hiera_s.yaml"
+
+# COCO-17 torso anchors fed to SAM 2 as positive-point prompts alongside
+# the YOLOX bbox: nose, L/R shoulder, L/R hip. Resolves the
+# foreground/background inversion ambiguity that wide bboxes hit on
+# frames 06/11 of test.mp4 (see M6 diagnosis). Wrists/ankles/face
+# excluded — extremity points risk snapping SAM to silhouette edges.
+_SAM_TORSO_KEYPOINTS = (0, 5, 6, 11, 12)
+# Per-point confidence gate. Higher than _KEYPOINT_BBOX_SCORE_THRESHOLD
+# (0.3) on purpose: a wrong positive point INSIDE the bbox actively
+# pulls SAM off the body, so we only trust high-confidence joints here.
+_SAM_KEYPOINT_SCORE_THRESHOLD = 0.5
+# Fewer than this many torso points surviving the gate → fail-loud
+# rather than ship a frame whose SAM prompt we don't trust.
+_SAM_MIN_TORSO_POINTS = 2
 
 # Minimum mask coverage to use mask-derived bbox; below this
 # we fall back to the M3 heuristic box. Threshold from M3
@@ -53,6 +68,166 @@ _SAPIENS_MEAN = np.array([123.5, 116.5, 103.5], dtype=np.float32)
 _SAPIENS_STD = np.array([58.5, 57.0, 57.5], dtype=np.float32)
 
 
+@dataclass
+class Stage1Result:
+    """Aggregated output of Stage 1. Consumed by Stage 2 as the input contract.
+
+    Persisted to a single .npz at the run dir root via save_stage1_result;
+    reload via load_stage1_result. Pixel-level artifacts (masks, normals)
+    are referenced by path so the bundle stays small; Stage 2 lazy-loads them.
+
+    theta_per_frame layout: joint 0 = global_orient, joints 1-23 = body_pose.
+    This is the 24-joint SMPL convention used throughout the Stage 2/3 contract;
+    the underlying hmr2 outputs (split global_orient + body_pose) are kept in
+    the per-frame smpl_NN.npz debug artifacts unchanged.
+    """
+
+    # Run metadata
+    run_id: str
+    run_dir: Path
+    video_path: Path
+
+    # User metadata (Stage 2 height-match loss consumes these)
+    height_cm: float
+    weight_kg: float
+    gender: str
+
+    # Keyframe geometry
+    keyframe_paths: list[Path]
+    n_frames: int
+    image_size_wh: tuple[int, int]
+
+    # Single source of truth for person bbox per frame (YOLOX detection,
+    # shared by SAM and hmr2 under option (c)).
+    bbox_xyxy: np.ndarray              # [N, 4] float32
+
+    # SMPL params
+    beta: np.ndarray                   # [10]      float32 — mean over keyframes
+    betas_per_frame: np.ndarray        # [N, 10]   float32 — raw hmr2 outputs
+    theta_per_frame: np.ndarray        # [N, 24, 3] float32 — axis-angle, joint 0 = global_orient
+    pred_cam_per_frame: np.ndarray     # [N, 3]    float32 — hmr2 crop-frame camera
+    pred_cam_t_per_frame: np.ndarray   # [N, 3]    float32 — full-image translation
+    focal_length_per_frame: np.ndarray # [N]       float32 — scaled, fx == fy
+
+    # 2D keypoints (COCO-17)
+    keypoints_2d: np.ndarray           # [N, 17, 2] float32 — pixel coords
+    keypoint_scores: np.ndarray        # [N, 17]    float32
+
+    # Pixel-level artifacts (large) referenced by path; Stage 2 lazy-loads
+    mask_paths: list[Path]             # masks/mask_NN.png   (uint8)
+    normal_paths: list[Path]           # normals/normal_NN.npz (normals + foreground)
+
+    def __post_init__(self) -> None:
+        # Normalize tuple-coercible fields so callers can pass list or tuple.
+        self.image_size_wh = tuple(self.image_size_wh)
+
+        # Scalars
+        if self.gender not in {"neutral", "male", "female"}:
+            raise ValueError(
+                f"gender: expected one of {{neutral, male, female}}, got {self.gender!r}"
+            )
+        if self.n_frames <= 0:
+            raise ValueError(f"n_frames: must be > 0, got {self.n_frames}")
+        if self.height_cm <= 0:
+            raise ValueError(f"height_cm: must be > 0, got {self.height_cm}")
+        if self.weight_kg <= 0:
+            raise ValueError(f"weight_kg: must be > 0, got {self.weight_kg}")
+
+        N = self.n_frames
+
+        def _check_len(name: str, actual: int, expected: int) -> None:
+            if actual != expected:
+                raise ValueError(f"{name}: expected length {expected}, got {actual}")
+
+        def _check_shape(name: str, arr: np.ndarray, expected: tuple) -> None:
+            if arr.shape != expected:
+                raise ValueError(
+                    f"{name}: expected shape {expected}, got {tuple(arr.shape)}"
+                )
+
+        _check_len("keyframe_paths", len(self.keyframe_paths), N)
+        _check_len("mask_paths", len(self.mask_paths), N)
+        _check_len("normal_paths", len(self.normal_paths), N)
+
+        _check_shape("bbox_xyxy", self.bbox_xyxy, (N, 4))
+        _check_shape("beta", self.beta, (10,))
+        _check_shape("betas_per_frame", self.betas_per_frame, (N, 10))
+        _check_shape("theta_per_frame", self.theta_per_frame, (N, 24, 3))
+        _check_shape("pred_cam_per_frame", self.pred_cam_per_frame, (N, 3))
+        _check_shape("pred_cam_t_per_frame", self.pred_cam_t_per_frame, (N, 3))
+        _check_shape("focal_length_per_frame", self.focal_length_per_frame, (N,))
+        _check_shape("keypoints_2d", self.keypoints_2d, (N, 17, 2))
+        _check_shape("keypoint_scores", self.keypoint_scores, (N, 17))
+
+
+def save_stage1_result(result: Stage1Result, path: Path) -> None:
+    """Write Stage1Result to a single .npz at `path`.
+
+    Strings stored as 0-d unicode arrays; paths stored as their str() form;
+    list[Path] stored as 1-d unicode arrays. load_stage1_result inverts this.
+    """
+    assert path.suffix == ".npz", (
+        f"save_stage1_result: path must end in .npz to match np.savez's "
+        f"own behavior (it silently appends .npz otherwise, desyncing the "
+        f"file path the caller thinks they wrote). Got: {path}"
+    )
+    np.savez(
+        str(path),
+        run_id=np.array(result.run_id),
+        run_dir=np.array(str(result.run_dir)),
+        video_path=np.array(str(result.video_path)),
+        height_cm=np.array(result.height_cm, dtype=np.float32),
+        weight_kg=np.array(result.weight_kg, dtype=np.float32),
+        gender=np.array(result.gender),
+        keyframe_paths=np.array([str(p) for p in result.keyframe_paths]),
+        n_frames=np.array(result.n_frames, dtype=np.int64),
+        image_size_wh=np.array(result.image_size_wh, dtype=np.int64),
+        bbox_xyxy=result.bbox_xyxy.astype(np.float32),
+        beta=result.beta.astype(np.float32),
+        betas_per_frame=result.betas_per_frame.astype(np.float32),
+        theta_per_frame=result.theta_per_frame.astype(np.float32),
+        pred_cam_per_frame=result.pred_cam_per_frame.astype(np.float32),
+        pred_cam_t_per_frame=result.pred_cam_t_per_frame.astype(np.float32),
+        focal_length_per_frame=result.focal_length_per_frame.astype(np.float32),
+        keypoints_2d=result.keypoints_2d.astype(np.float32),
+        keypoint_scores=result.keypoint_scores.astype(np.float32),
+        mask_paths=np.array([str(p) for p in result.mask_paths]),
+        normal_paths=np.array([str(p) for p in result.normal_paths]),
+    )
+
+
+def load_stage1_result(path: Path) -> Stage1Result:
+    """Inverse of save_stage1_result. Casts strings/paths/scalars back to Python types.
+
+    allow_pickle=False is safe here: every field is stored as a native numpy
+    dtype (no object arrays). Strings are unicode arrays (<U...) and round-trip
+    without pickle.
+    """
+    data = np.load(str(path), allow_pickle=False)
+    return Stage1Result(
+        run_id=str(data["run_id"].item()),
+        run_dir=Path(str(data["run_dir"].item())),
+        video_path=Path(str(data["video_path"].item())),
+        height_cm=float(data["height_cm"].item()),
+        weight_kg=float(data["weight_kg"].item()),
+        gender=str(data["gender"].item()),
+        keyframe_paths=[Path(str(p)) for p in data["keyframe_paths"]],
+        n_frames=int(data["n_frames"].item()),
+        image_size_wh=tuple(int(x) for x in data["image_size_wh"]),
+        bbox_xyxy=data["bbox_xyxy"],
+        beta=data["beta"],
+        betas_per_frame=data["betas_per_frame"],
+        theta_per_frame=data["theta_per_frame"],
+        pred_cam_per_frame=data["pred_cam_per_frame"],
+        pred_cam_t_per_frame=data["pred_cam_t_per_frame"],
+        focal_length_per_frame=data["focal_length_per_frame"],
+        keypoints_2d=data["keypoints_2d"],
+        keypoint_scores=data["keypoint_scores"],
+        mask_paths=[Path(str(p)) for p in data["mask_paths"]],
+        normal_paths=[Path(str(p)) for p in data["normal_paths"]],
+    )
+
+
 def _make_box_prompt(image: np.ndarray) -> np.ndarray:
     """Returns [x1, y1, x2, y2] heuristic center crop: 80% width, 90% height."""
     h, w = image.shape[:2]
@@ -62,28 +237,77 @@ def _make_box_prompt(image: np.ndarray) -> np.ndarray:
     )
 
 
-def segment_keyframes(keyframe_paths: list[Path], run_dir: Path) -> list[Path]:
-    """SAM 2 person mask per keyframe. Returns list of mask PNG paths."""
+def segment_keyframes(
+    keyframe_paths: list[Path],
+    bboxes_xyxy: np.ndarray,
+    keypoints_2d: np.ndarray,
+    keypoint_scores: np.ndarray,
+    run_dir: Path,
+) -> list[Path]:
+    """SAM 2 person mask per keyframe, prompted with YOLOX bbox + positive-point
+    torso anchors from RTMPose.
+
+    Under M6 (option c), the bbox is the YOLOX detection from
+    extract_keypoints, shared with extract_smpl_params. The bbox alone is
+    ambiguous on frames where the person occupies a narrow vertical strip
+    inside a near-image-width bbox (e.g. spread arms): SAM's three
+    multimask candidates may include the inverted background region and
+    rank it highest. Adding torso keypoints as positive points
+    (point_labels == 1) tells SAM which pixels are the person and breaks
+    that ambiguity.
+
+    Inputs are parallel arrays from kp_NN.npz (loaded by pipeline.run):
+        bboxes_xyxy:     [N, 4]
+        keypoints_2d:    [N, 17, 2]
+        keypoint_scores: [N, 17]
+
+    Raises if fewer than _SAM_MIN_TORSO_POINTS torso keypoints clear
+    _SAM_KEYPOINT_SCORE_THRESHOLD on any frame.
+    """
     masks_dir = run_dir / "masks"
+    torso_idx = np.array(_SAM_TORSO_KEYPOINTS, dtype=np.int64)
 
     model = build_sam2(_SAM2_CONFIG, str(settings.sam2_checkpoint), device=settings.device)
     predictor = SAM2ImagePredictor(model)
     logger.info("SAM 2 loaded: {}", settings.sam2_checkpoint)
 
     saved: list[Path] = []
-    for kf_path in keyframe_paths:
+    for kf_path, bbox, kps, kp_scs in zip(
+        keyframe_paths, bboxes_xyxy, keypoints_2d, keypoint_scores
+    ):
+        idx = kf_path.stem.split("_")[-1]  # "keyframe_03" -> "03"
+
+        # Filter torso candidates by confidence; keep the COCO indices that
+        # survive so the per-frame log can show which joints fired.
+        torso_kps = kps[torso_idx]                # [5, 2]
+        torso_scs = kp_scs[torso_idx]             # [5]
+        keep = torso_scs >= _SAM_KEYPOINT_SCORE_THRESHOLD
+        n_kept = int(keep.sum())
+        if n_kept < _SAM_MIN_TORSO_POINTS:
+            raise RuntimeError(
+                f"frame {idx}: only {n_kept} torso keypoint(s) above score "
+                f"{_SAM_KEYPOINT_SCORE_THRESHOLD} (need >= {_SAM_MIN_TORSO_POINTS}); "
+                f"cannot trust SAM prompt. Torso scores: "
+                f"{dict(zip(_SAM_TORSO_KEYPOINTS, torso_scs.tolist()))}"
+            )
+        positive_points = torso_kps[keep].astype(np.float32)            # [K, 2]
+        positive_labels = np.ones(n_kept, dtype=np.int32)
+        kept_coco = tuple(int(i) for i in torso_idx[keep].tolist())
+
         img_bgr = cv2.imread(str(kf_path))
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
         predictor.set_image(img_rgb)
         masks, scores, _ = predictor.predict(
-            box=_make_box_prompt(img_rgb), multimask_output=True
+            point_coords=positive_points,
+            point_labels=positive_labels,
+            box=bbox.astype(np.float32),
+            multimask_output=True,
         )
 
         best = int(np.argmax(scores))
         mask = masks[best].astype(bool)
 
-        idx = kf_path.stem.split("_")[-1]  # "keyframe_03" -> "03"
         mask_path = masks_dir / f"mask_{idx}.png"
         cv2.imwrite(str(mask_path), (mask * 255).astype(np.uint8))
 
@@ -96,8 +320,9 @@ def segment_keyframes(keyframe_paths: list[Path], run_dir: Path) -> list[Path]:
         )
 
         logger.info(
-            "mask_{}.png: score={:.4f}, coverage={:.1f}%",
+            "mask_{}.png: score={:.4f}, coverage={:.1f}%, positive_points={} {}",
             idx, scores[best], 100.0 * mask.sum() / mask.size,
+            n_kept, kept_coco,
         )
         saved.append(mask_path)
 
@@ -134,10 +359,21 @@ def _mask_to_bbox(mask: np.ndarray, pad: float = 0.15) -> np.ndarray | None:
 
 def extract_smpl_params(
     keyframe_paths: list[Path],
-    mask_paths: list[Path],
+    bboxes_xyxy: np.ndarray,
     run_dir: Path,
 ) -> list[Path]:
-    """4D Humans inference per keyframe. Returns list of .npz paths."""
+    """4D Humans inference per keyframe. Returns list of .npz paths.
+
+    bboxes_xyxy: [N, 4] XYXY, row i for keyframe_paths[i]. Under M6
+    (option c) this is the YOLOX detection from extract_keypoints,
+    shared with segment_keyframes. hmr2's ViTDetDataset accepts XYXY
+    directly and squares the crop internally — no pre-padding needed.
+
+    bbox_source written into smpl_NN.npz is always "detection" on this
+    code path. The field is retained for backwards-compat with older
+    M4/M5 runs whose .npzs may carry "mask-derived" or
+    "heuristic-fallback".
+    """
     out_dir = run_dir / "smpl_params"
     out_dir.mkdir(exist_ok=True)
 
@@ -148,21 +384,16 @@ def extract_smpl_params(
 
     saved: list[Path] = []
 
-    for kf_path, mask_path in zip(keyframe_paths, mask_paths):
+    for kf_path, bbox in zip(keyframe_paths, bboxes_xyxy):
         idx = kf_path.stem.split("_")[-1]  # "keyframe_03" -> "03"
 
         img_bgr = cv2.imread(str(kf_path))
 
-        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-        bbox = _mask_to_bbox(mask)
-        if bbox is not None:
-            bbox_source = "mask-derived"
-        else:
-            bbox = _make_box_prompt(img_bgr)
-            bbox_source = "heuristic-fallback"
+        bbox = bbox.astype(np.float32)
+        bbox_source = "detection"
         logger.info(
-            "frame {}: bbox_source={}, bbox=[{:.0f},{:.0f},{:.0f},{:.0f}]",
-            idx, bbox_source, bbox[0], bbox[1], bbox[2], bbox[3],
+            "frame {}: bbox=[{:.0f},{:.0f},{:.0f},{:.0f}]",
+            idx, bbox[0], bbox[1], bbox[2], bbox[3],
         )
 
         dataloader = torch.utils.data.DataLoader(

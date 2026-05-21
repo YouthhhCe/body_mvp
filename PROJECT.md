@@ -224,7 +224,7 @@ Each stage lives in a single file by design. `body_mvp/` is a flat package, not 
   - Goal: per-frame 2D keypoints and surface normal predictions
   - Acceptance: keypoint overlay and normal map visualizations look sensible per frame
 
-- [ ] **M6 — Stage 1 end-to-end**
+- [x] **M6 — Stage 1 end-to-end**
   - Goal: unified `Stage1Result` produced from a single CLI run, saved to disk
   - Acceptance: can load `Stage1Result` from disk in a REPL and inspect all fields
 
@@ -262,12 +262,23 @@ Things that have bitten others working on similar pipelines:
 5. Loose clothing produces bad silhouettes and bad reconstruction. No algorithmic fix in MVP; relies on user wearing tight clothes.
 6. Per-frame β from 4D Humans is noisy; shape parameters should be shared or averaged across keyframes.
 7. PyTorch3D's silhouette renderer requires a soft/differentiable shader (e.g., `SoftSilhouetteShader`) for optimization; the default rasterizer is non-differentiable.
+8. SAM 2 prompted with only a near-image-width box can return the *inverted* (background) region as its argmax candidate when the person occupies a narrow vertical strip inside the box (e.g. spread arms). All three `multimask_output=True` candidates can score below 0.30 with no good alternative to re-pick. Fix: combine the box with a small set of positive-point prompts placed on torso-core keypoints (shoulders + hips, ± nose), filtered by per-point confidence. The box alone is sufficient only for narrow person crops.
 
 ---
 
 ## Current status
 
-M5 complete. All four Stage 1 per-frame sub-tasks now exist on disk for the 12 keyframes of `test.mp4`: masks (SAM 2, all 12 clean after the M5 keypoint-guided refine), SMPL β/θ (4D Humans), 2D keypoints (RTMPose COCO-17), and surface normals (Sapiens-Normal 0.3B, camera-frame). M3 mask debt is resolved — the 4 previously-failed side-view frames were re-run via `refine_masks_with_keypoints` using a keypoint-derived bbox. `pipeline.run()` integration of all sub-tasks into `Stage1Result` is still M6's job. Next: M6.
+M6 complete. `pipeline.run()` now runs Stage 1 end-to-end on a fresh `run_id` per invocation, producing a single `Stage1Result` (dataclass) persisted as `<run_dir>/stage1_result.npz` alongside the per-sub-task debug artifacts. A round-trip load self-check runs every pipeline invocation and raises on any drift.
+
+Architectural decisions baked in by M6:
+- **Option (c) bbox plumbing:** RTMPose's YOLOX detector runs first; its per-frame XYXY bbox is the single source of truth for "where is the person", shared by both SAM 2 and 4D Humans (hmr2). `refine_masks_with_keypoints` from M5 is no longer pipeline-called; its purpose is subsumed by SAM having a good bbox from the start.
+- **SAM 2 prompted with box + torso-keypoint positive points** (COCO indices 0, 5, 6, 11, 12) to resolve the wide-bbox foreground/background inversion ambiguity. See Implementation pitfalls #8.
+- **β aggregation:** per-component mean across the 12 keyframes. Per-frame betas preserved alongside in `Stage1Result.betas_per_frame` for future re-aggregation without re-inference.
+- **`theta_per_frame: [N, 24, 3]`** in `Stage1Result` uses the 24-joint convention (joint 0 = global_orient, 1–23 = body_pose); the underlying per-frame `smpl_NN.npz` keeps the split hmr2 layout unchanged.
+
+`pipeline.run()` no longer calls `stage1.run` / `stage2.run` / `stage3.run` stubs. M7 must wire `stage2.run()` back in when the optimization loop is implemented.
+
+Latest end-to-end run: `data/runs/20260521_132028/` on `test.mp4` — all 12 masks visually correct, β stable across two consecutive runs to 3 decimal places, round-trip self-check passes. Next: M7.
 
 Environment (verified reproducible on a second LAN server; see `MIGRATION_GUIDE.md`):
 - Conda env `dyc_bodymvp` (Python 3.10)
