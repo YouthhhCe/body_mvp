@@ -36,7 +36,7 @@ FACES_PER_PIXEL: int = 25         # SoftSilhouetteShader fragment depth
 LOSS_WEIGHTS: dict[str, float] = {
     "silhouette": 1.0,
     "normal": 0.5,
-    "keypoint": 0.1,
+    "keypoint": 1e-3,   # placeholder; pixel² vs [0,1] IoU — tune in D14
     "laplacian": 100.0,
     "symmetry": 0.01,
     "height": 10.0,

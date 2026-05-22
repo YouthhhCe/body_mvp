@@ -1,5 +1,5 @@
 """Stage 2 loss terms: silhouette IoU (soft + hard), weighted silhouette IoU,
-height match, Laplacian smoothing, normal consistency."""
+height match, keypoint reprojection, Laplacian smoothing, normal consistency."""
 
 import torch
 from pytorch3d.loss import mesh_laplacian_smoothing, mesh_normal_consistency
@@ -72,6 +72,42 @@ def height_loss(
     y_span = v_canonical[:, 1].max() - v_canonical[:, 1].min()
     excess = (torch.abs(y_span - target_height_m) - tolerance_m).clamp(min=0.0)
     return excess * excess
+
+
+def keypoint_reprojection_loss(
+    joints_world: torch.Tensor,               # [N, 24, 3]
+    keypoints_2d: torch.Tensor,               # [N, 17, 2] (x,y) in render pixels
+    keypoint_scores: torch.Tensor,            # [N, 17]
+    coco_to_smpl: tuple[tuple[int, int], ...],
+    fl_render: torch.Tensor,                  # [N] focal length at render resolution
+    image_hw: tuple[int, int],                # (Ht, Wt)
+    score_threshold: float = 0.3,
+) -> torch.Tensor:
+    """Mean squared pixel reprojection error over COCO-SMPL joint pairs that
+    pass the score gate. Returns zero if no valid pairs exist.
+
+    Projection: u = fl*X/Z + cx, v = fl*Y/Z + cy (OpenCV, Z=depth, +Y down).
+    joints_world is already in camera space (pred_cam_t applied in _pose_meshes).
+    """
+    Ht, Wt = image_hw
+    cx = Wt * 0.5
+    cy = Ht * 0.5
+    coco_idxs = [pair[0] for pair in coco_to_smpl]
+    smpl_idxs  = [pair[1] for pair in coco_to_smpl]
+
+    kp_paired     = keypoints_2d[:, coco_idxs, :]     # [N, P, 2]
+    joints_paired = joints_world[:, smpl_idxs, :]     # [N, P, 3]
+    scores_paired = keypoint_scores[:, coco_idxs]     # [N, P]
+
+    fl    = fl_render.unsqueeze(1)                     # [N, 1]
+    Z     = joints_paired[:, :, 2].clamp(min=1e-3)    # [N, P]
+    proj_u = fl * joints_paired[:, :, 0] / Z + cx     # [N, P]
+    proj_v = fl * joints_paired[:, :, 1] / Z + cy     # [N, P]
+
+    valid   = scores_paired > score_threshold          # [N, P] bool
+    n_valid = valid.float().sum().clamp(min=1.0)
+    err2    = (proj_u - kp_paired[:, :, 0]) ** 2 + (proj_v - kp_paired[:, :, 1]) ** 2
+    return (err2 * valid.float()).sum() / n_valid
 
 
 def laplacian_smoothing_loss(meshes: Meshes) -> torch.Tensor:

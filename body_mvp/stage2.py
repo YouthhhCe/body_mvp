@@ -27,6 +27,7 @@ from body_mvp.config import (
 from body_mvp.losses import (
     hard_iou_per_frame,
     height_loss,
+    keypoint_reprojection_loss,
     laplacian_smoothing_loss,
     normal_consistency_loss,
     weighted_silhouette_iou_loss,
@@ -73,6 +74,24 @@ _SYM_WEIGHT_PER_JOINT: dict[int, float] = {
     22: 0.7, 23: 0.7,            # L_hand, R_hand
     12: 1.0, 15: 1.0,            # neck, head
 }
+
+# COCO-17 → SMPL-24 joint index pairs for D10 keypoint reprojection.
+# Only joints with direct anatomical correspondence are included (12 pairs;
+# head/nose excluded because SMPL joint 15 is the neck top, not the nose tip).
+_COCO_TO_SMPL: tuple[tuple[int, int], ...] = (
+    (5,  16),  # L_shoulder
+    (6,  17),  # R_shoulder
+    (7,  18),  # L_elbow
+    (8,  19),  # R_elbow
+    (9,  20),  # L_wrist
+    (10, 21),  # R_wrist
+    (11, 1),   # L_hip
+    (12, 2),   # R_hip
+    (13, 4),   # L_knee
+    (14, 5),   # R_knee
+    (15, 7),   # L_ankle
+    (16, 8),   # R_ankle
+)
 
 
 @dataclass
@@ -467,7 +486,7 @@ def _pose_meshes(
     delta_v: torch.Tensor,       # [6890, 3] float, requires_grad=True (or zeros for sanity)
     pred_cam_t: torch.Tensor,    # [N, 3]    float (full-image translation from hmr2)
     device: str,
-) -> Meshes:
+) -> tuple[Meshes, torch.Tensor]:  # (Meshes, joints_world [N,24,3])
     """β-shape + ΔV applied in canonical T-pose space, then LBS-posed per
     frame, then SMPL→OpenCV-camera flip applied.
 
@@ -494,7 +513,7 @@ def _pose_meshes(
 
     # Step 3: LBS. Pose blendshapes (posedirs @ (R_j - I)) are still applied
     # internally on top of v_template; they're independent of β.
-    verts_posed, _joints = smplx.lbs.lbs(
+    verts_posed, joints_posed = smplx.lbs.lbs(
         betas=betas_zero,
         pose=pose_batched,
         v_template=v_template_batched,
@@ -504,7 +523,7 @@ def _pose_meshes(
         parents=smpl_model.parents,
         lbs_weights=smpl_model.lbs_weights,
         pose2rot=True,
-    )  # [N, 6890, 3]
+    )  # verts_posed [N, 6890, 3], joints_posed [N, 24, 3]
 
     # Step 4: add hmr2's full-image translation. NO additional flip is
     # needed, despite hmr2's pyrender path applying a 180° X rotation.
@@ -523,13 +542,14 @@ def _pose_meshes(
     # y=-1.001 (global_orient flips), after +cam_t y=-0.598. PyTorch3D
     # OpenCV projection v = fy*Y/Z + cy = 37500 * (-0.598) / 51.37 + 960
     # ≈ 524, matching M4's measured head y_top=512.
-    verts_world = verts_posed + pred_cam_t.unsqueeze(1)  # [N, 6890, 3]
+    verts_world  = verts_posed  + pred_cam_t.unsqueeze(1)  # [N, 6890, 3]
+    joints_world = joints_posed + pred_cam_t.unsqueeze(1)  # [N, 24, 3]
 
     # Step 5: wrap as a batched PyTorch3D Meshes.
     faces_np = smpl_model.faces.astype(np.int64)
     faces = torch.from_numpy(faces_np).to(device)
     faces_batched = faces.unsqueeze(0).expand(N, -1, -1)
-    return Meshes(verts=verts_world, faces=faces_batched)
+    return Meshes(verts=verts_world, faces=faces_batched), joints_world
 
 
 def _compute_render_resolution(W_orig: int, H_orig: int) -> tuple[int, int, float]:
@@ -615,7 +635,7 @@ def sanity_render_frame00(stage1_result: Stage1Result) -> Path:
     delta_v = torch.zeros(6890, 3, device=device)
 
     with torch.no_grad():
-        meshes = _pose_meshes(smpl_model, beta, theta_0, delta_v, cam_t_0, device)
+        meshes, _ = _pose_meshes(smpl_model, beta, theta_0, delta_v, cam_t_0, device)
         fl_render_val = fl_orig_0 / _HMR2_CROP_SIZE * max(Wt, Ht)
         fl_render = torch.tensor([fl_render_val], device=device)
         cameras = build_cameras(fl_render, (Ht, Wt), device)
@@ -685,7 +705,7 @@ def sanity_render_all_frames(stage1_result: Stage1Result) -> list[Path]:
     delta_v = torch.zeros(6890, 3, device=device)
 
     with torch.no_grad():
-        meshes = _pose_meshes(smpl_model, beta, theta, delta_v, cam_t, device)
+        meshes, _ = _pose_meshes(smpl_model, beta, theta, delta_v, cam_t, device)
 
         fl_render = fl_orig / _HMR2_CROP_SIZE * max(Wt, Ht)                            # [N]
         cameras = build_cameras(fl_render, (Ht, Wt), device)
@@ -815,11 +835,12 @@ def optimize_vertex_offsets(
     Ht, Wt, _scale = _compute_render_resolution(W_orig, H_orig)
     logger.info(
         "Stage 2 setup: N={}, render={}x{}, lr={}, iters={}, "
-        "w_silh={}, w_lap={}, w_nc={}, w_height={}, grad_clip={}, "
+        "w_silh={}, w_lap={}, w_nc={}, w_height={}, w_kp={}, grad_clip={}, "
         "target_height={:.2f}m±{:.2f}m",
         N, Wt, Ht, LEARNING_RATE, OPT_MAX_ITERS,
         LOSS_WEIGHTS["silhouette"], LOSS_WEIGHTS["laplacian"],
         LOSS_WEIGHTS["normal_consistency"], LOSS_WEIGHTS["height"],
+        LOSS_WEIGHTS["keypoint"],
         GRAD_CLIP_NORM,
         stage1_result.height_cm / 100.0, HEIGHT_TOLERANCE_M,
     )
@@ -845,6 +866,15 @@ def optimize_vertex_offsets(
         ).squeeze(0).detach()
     target_height_m: float = stage1_result.height_cm / 100.0
 
+    # Keypoints scaled to render resolution (original coords × Wt/W_orig).
+    kp_scale = float(Wt) / W_orig
+    kp_xy = torch.from_numpy(
+        stage1_result.keypoints_2d.astype(np.float32) * kp_scale
+    ).to(device)  # [N, 17, 2]
+    kp_scores = torch.from_numpy(
+        stage1_result.keypoint_scores.astype(np.float32)
+    ).to(device)  # [N, 17]
+
     fl_render = fl_orig / _HMR2_CROP_SIZE * max(Wt, Ht)
     cameras = build_cameras(fl_render, (Ht, Wt), device)
     renderer = build_silhouette_renderer(cameras, (Ht, Wt), FACES_PER_PIXEL)
@@ -856,7 +886,7 @@ def optimize_vertex_offsets(
 
     # --- Initial IoU (ΔV=0) + weight map ---
     with torch.no_grad():
-        meshes0 = _pose_meshes(smpl_model, beta, theta, delta_v, cam_t, device)
+        meshes0, _ = _pose_meshes(smpl_model, beta, theta, delta_v, cam_t, device)
         alpha0 = renderer(meshes0)[..., 3]
         initial_iou = hard_iou_per_frame((alpha0 > 0.5).float(), target_masks).cpu().numpy()
         # Silhouette region weight map: computed once from the initial mesh.
@@ -880,26 +910,31 @@ def optimize_vertex_offsets(
         "laplacian": [],
         "normal_consistency": [],
         "height": [],
+        "keypoint": [],
     }
     LOG_EVERY = 10
 
-    w_silh = float(LOSS_WEIGHTS["silhouette"])
-    w_lap = float(LOSS_WEIGHTS["laplacian"])
-    w_nc = float(LOSS_WEIGHTS["normal_consistency"])
+    w_silh   = float(LOSS_WEIGHTS["silhouette"])
+    w_lap    = float(LOSS_WEIGHTS["laplacian"])
+    w_nc     = float(LOSS_WEIGHTS["normal_consistency"])
     w_height = float(LOSS_WEIGHTS["height"])
+    w_kp     = float(LOSS_WEIGHTS["keypoint"])
 
     for it in range(OPT_MAX_ITERS):
         optimizer.zero_grad()
 
         v_canonical = smpl_model.v_template + v_shape_only + delta_v  # [6890, 3]
-        meshes = _pose_meshes(smpl_model, beta, theta, delta_v, cam_t, device)
+        meshes, joints_world = _pose_meshes(smpl_model, beta, theta, delta_v, cam_t, device)
         alpha = renderer(meshes)[..., 3]                 # [N, Ht, Wt]
 
-        L_silh = weighted_silhouette_iou_loss(alpha, target_masks, weight_map)
-        L_lap = laplacian_smoothing_loss(meshes)
-        L_nc = normal_consistency_loss(meshes)
+        L_silh   = weighted_silhouette_iou_loss(alpha, target_masks, weight_map)
+        L_lap    = laplacian_smoothing_loss(meshes)
+        L_nc     = normal_consistency_loss(meshes)
         L_height = height_loss(v_canonical, target_height_m, HEIGHT_TOLERANCE_M)
-        L = w_silh * L_silh + w_lap * L_lap + w_nc * L_nc + w_height * L_height
+        L_kp     = keypoint_reprojection_loss(
+            joints_world, kp_xy, kp_scores, _COCO_TO_SMPL, fl_render, (Ht, Wt),
+        )
+        L = w_silh * L_silh + w_lap * L_lap + w_nc * L_nc + w_height * L_height + w_kp * L_kp
 
         L.backward()
         torch.nn.utils.clip_grad_norm_([delta_v], max_norm=GRAD_CLIP_NORM)
@@ -910,12 +945,13 @@ def optimize_vertex_offsets(
         per_term_lists["laplacian"].append(float(L_lap.item()))
         per_term_lists["normal_consistency"].append(float(L_nc.item()))
         per_term_lists["height"].append(float(L_height.item()))
+        per_term_lists["keypoint"].append(float(L_kp.item()))
         if it % LOG_EVERY == 0 or it == OPT_MAX_ITERS - 1:
             logger.info(
                 "iter {:3d}: L={:.5f}  silh={:.5f}  lap={:.5f}  nc={:.5f}  "
-                "height={:.5f}  |ΔV|_max={:.5f}",
+                "height={:.5f}  kp={:.2f}  |ΔV|_max={:.5f}",
                 it, float(L.item()), float(L_silh.item()), float(L_lap.item()),
-                float(L_nc.item()), float(L_height.item()),
+                float(L_nc.item()), float(L_height.item()), float(L_kp.item()),
                 float(delta_v.detach().abs().max().item()),
             )
 
@@ -925,7 +961,7 @@ def optimize_vertex_offsets(
 
     # --- Final IoU + bookkeeping ---
     with torch.no_grad():
-        meshes_f = _pose_meshes(smpl_model, beta, theta, delta_v, cam_t, device)
+        meshes_f, _ = _pose_meshes(smpl_model, beta, theta, delta_v, cam_t, device)
         alpha_f = renderer(meshes_f)[..., 3]
         final_iou = hard_iou_per_frame((alpha_f > 0.5).float(), target_masks).cpu().numpy()
 
@@ -952,6 +988,7 @@ def optimize_vertex_offsets(
         lap_weighted_arr = w_lap * per_term_history["laplacian"]
         nc_weighted_arr = w_nc * per_term_history["normal_consistency"]
         height_weighted_arr = w_height * per_term_history["height"]
+        kp_weighted_arr = w_kp * per_term_history["keypoint"]
 
         fig, ax = plt.subplots(figsize=(8, 5))
         ax.plot(iters, total_arr, label="total", linewidth=2.0, color="black")
@@ -967,6 +1004,10 @@ def optimize_vertex_offsets(
         ax.plot(
             iters, height_weighted_arr,
             label=f"height (w={w_height})", linewidth=1.2, color="tab:red",
+        )
+        ax.plot(
+            iters, kp_weighted_arr,
+            label=f"keypoint (w={w_kp})", linewidth=1.2, color="tab:purple",
         )
         ax.set_xlabel("iteration")
         ax.set_ylabel("loss")
@@ -1041,9 +1082,9 @@ def save_silhouette_debug(
     delta_v_final = torch.from_numpy(stage2_result.delta_v).to(device).float()
 
     with torch.no_grad():
-        meshes_init = _pose_meshes(smpl_model, beta, theta, delta_v_init, cam_t, device)
+        meshes_init, _ = _pose_meshes(smpl_model, beta, theta, delta_v_init, cam_t, device)
         alpha_init = renderer(meshes_init)[..., 3].cpu().numpy()    # [N, Ht, Wt]
-        meshes_final = _pose_meshes(smpl_model, beta, theta, delta_v_final, cam_t, device)
+        meshes_final, _ = _pose_meshes(smpl_model, beta, theta, delta_v_final, cam_t, device)
         alpha_final = renderer(meshes_final)[..., 3].cpu().numpy()
 
     init_paths: list[Path] = []
