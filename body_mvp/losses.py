@@ -1,5 +1,6 @@
 """Stage 2 loss terms: silhouette IoU (soft + hard), weighted silhouette IoU,
-height match, keypoint reprojection, Laplacian smoothing, normal consistency."""
+height match, keypoint reprojection, bilateral symmetry, Laplacian smoothing,
+normal consistency."""
 
 import torch
 from pytorch3d.loss import mesh_laplacian_smoothing, mesh_normal_consistency
@@ -108,6 +109,28 @@ def keypoint_reprojection_loss(
     n_valid = valid.float().sum().clamp(min=1.0)
     err2    = (proj_u - kp_paired[:, :, 0]) ** 2 + (proj_v - kp_paired[:, :, 1]) ** 2
     return (err2 * valid.float()).sum() / n_valid
+
+
+def symmetry_loss(
+    delta_v: torch.Tensor,              # [6890, 3]
+    sym_region_weights: torch.Tensor,   # [6890] float32 — from _build_region_weights
+    right_to_left: torch.Tensor,        # [6890] int64  — mirror map from _build_region_weights
+) -> torch.Tensor:
+    """Weighted bilateral symmetry regularizer on ΔV in canonical T-pose space.
+
+    For each vertex i, penalizes |ΔV[i] − mirror(ΔV[j])|² where j is its
+    mirror partner. mirror flips x (canonical +x = subject's left).
+
+    Belly vertices (sym_weight=0) and non-involution vertices (sym_weight=0
+    post-gate in D7) are excluded. Normalised by total weight sum so sparse
+    weights don't dilute the signal.
+    """
+    mirror_sign  = delta_v.new_tensor([-1., 1., 1.])    # flip x only
+    dv_partner   = delta_v[right_to_left]                # [6890, 3] — partner's ΔV
+    dv_reflected = dv_partner * mirror_sign              # partner's ΔV as seen from this side
+    err2 = ((delta_v - dv_reflected) ** 2).sum(dim=1)   # [6890]
+    w_sum = sym_region_weights.sum().clamp(min=1.0)
+    return (sym_region_weights * err2).sum() / w_sum
 
 
 def laplacian_smoothing_loss(meshes: Meshes) -> torch.Tensor:

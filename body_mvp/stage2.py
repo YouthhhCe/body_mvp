@@ -30,6 +30,7 @@ from body_mvp.losses import (
     keypoint_reprojection_loss,
     laplacian_smoothing_loss,
     normal_consistency_loss,
+    symmetry_loss,
     weighted_silhouette_iou_loss,
 )
 from body_mvp.render import build_cameras, build_silhouette_renderer
@@ -835,12 +836,12 @@ def optimize_vertex_offsets(
     Ht, Wt, _scale = _compute_render_resolution(W_orig, H_orig)
     logger.info(
         "Stage 2 setup: N={}, render={}x{}, lr={}, iters={}, "
-        "w_silh={}, w_lap={}, w_nc={}, w_height={}, w_kp={}, grad_clip={}, "
+        "w_silh={}, w_lap={}, w_nc={}, w_height={}, w_kp={}, w_sym={}, grad_clip={}, "
         "target_height={:.2f}m±{:.2f}m",
         N, Wt, Ht, LEARNING_RATE, OPT_MAX_ITERS,
         LOSS_WEIGHTS["silhouette"], LOSS_WEIGHTS["laplacian"],
         LOSS_WEIGHTS["normal_consistency"], LOSS_WEIGHTS["height"],
-        LOSS_WEIGHTS["keypoint"],
+        LOSS_WEIGHTS["keypoint"], LOSS_WEIGHTS["symmetry"],
         GRAD_CLIP_NORM,
         stage1_result.height_cm / 100.0, HEIGHT_TOLERANCE_M,
     )
@@ -911,6 +912,7 @@ def optimize_vertex_offsets(
         "normal_consistency": [],
         "height": [],
         "keypoint": [],
+        "symmetry": [],
     }
     LOG_EVERY = 10
 
@@ -919,6 +921,7 @@ def optimize_vertex_offsets(
     w_nc     = float(LOSS_WEIGHTS["normal_consistency"])
     w_height = float(LOSS_WEIGHTS["height"])
     w_kp     = float(LOSS_WEIGHTS["keypoint"])
+    w_sym    = float(LOSS_WEIGHTS["symmetry"])
 
     for it in range(OPT_MAX_ITERS):
         optimizer.zero_grad()
@@ -934,7 +937,9 @@ def optimize_vertex_offsets(
         L_kp     = keypoint_reprojection_loss(
             joints_world, kp_xy, kp_scores, _COCO_TO_SMPL, fl_render, (Ht, Wt),
         )
-        L = w_silh * L_silh + w_lap * L_lap + w_nc * L_nc + w_height * L_height + w_kp * L_kp
+        L_sym    = symmetry_loss(delta_v, sym_region_weights, right_to_left)
+        L = (w_silh * L_silh + w_lap * L_lap + w_nc * L_nc
+             + w_height * L_height + w_kp * L_kp + w_sym * L_sym)
 
         L.backward()
         torch.nn.utils.clip_grad_norm_([delta_v], max_norm=GRAD_CLIP_NORM)
@@ -946,12 +951,14 @@ def optimize_vertex_offsets(
         per_term_lists["normal_consistency"].append(float(L_nc.item()))
         per_term_lists["height"].append(float(L_height.item()))
         per_term_lists["keypoint"].append(float(L_kp.item()))
+        per_term_lists["symmetry"].append(float(L_sym.item()))
         if it % LOG_EVERY == 0 or it == OPT_MAX_ITERS - 1:
             logger.info(
                 "iter {:3d}: L={:.5f}  silh={:.5f}  lap={:.5f}  nc={:.5f}  "
-                "height={:.5f}  kp={:.2f}  |ΔV|_max={:.5f}",
+                "height={:.5f}  kp={:.2f}  sym={:.5f}  |ΔV|_max={:.5f}",
                 it, float(L.item()), float(L_silh.item()), float(L_lap.item()),
                 float(L_nc.item()), float(L_height.item()), float(L_kp.item()),
+                float(L_sym.item()),
                 float(delta_v.detach().abs().max().item()),
             )
 
@@ -988,7 +995,8 @@ def optimize_vertex_offsets(
         lap_weighted_arr = w_lap * per_term_history["laplacian"]
         nc_weighted_arr = w_nc * per_term_history["normal_consistency"]
         height_weighted_arr = w_height * per_term_history["height"]
-        kp_weighted_arr = w_kp * per_term_history["keypoint"]
+        kp_weighted_arr  = w_kp * per_term_history["keypoint"]
+        sym_weighted_arr = w_sym * per_term_history["symmetry"]
 
         fig, ax = plt.subplots(figsize=(8, 5))
         ax.plot(iters, total_arr, label="total", linewidth=2.0, color="black")
@@ -1008,6 +1016,10 @@ def optimize_vertex_offsets(
         ax.plot(
             iters, kp_weighted_arr,
             label=f"keypoint (w={w_kp})", linewidth=1.2, color="tab:purple",
+        )
+        ax.plot(
+            iters, sym_weighted_arr,
+            label=f"symmetry (w={w_sym})", linewidth=1.2, color="tab:brown",
         )
         ax.set_xlabel("iteration")
         ax.set_ylabel("loss")
