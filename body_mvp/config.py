@@ -31,6 +31,7 @@ OPT_MAX_ITERS: int = 200
 LEARNING_RATE: float = 1e-3       # M7 initial; revisit in M8
 GRAD_CLIP_NORM: float = 1.0       # M7 defense vs. pitfall #3 explosions
 RENDER_RESOLUTION: int = 512      # long side; bumped 256->512 for M8 (normal/keypoint detail)
+HEIGHT_TOLERANCE_M: float = 0.05  # ±5 cm dead-band for height loss; no penalty inside band
 FACES_PER_PIXEL: int = 25         # SoftSilhouetteShader fragment depth
 LOSS_WEIGHTS: dict[str, float] = {
     "silhouette": 1.0,

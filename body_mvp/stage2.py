@@ -17,6 +17,7 @@ from pytorch3d.structures import Meshes
 from body_mvp.config import (
     FACES_PER_PIXEL,
     GRAD_CLIP_NORM,
+    HEIGHT_TOLERANCE_M,
     LEARNING_RATE,
     LOSS_WEIGHTS,
     OPT_MAX_ITERS,
@@ -25,6 +26,7 @@ from body_mvp.config import (
 )
 from body_mvp.losses import (
     hard_iou_per_frame,
+    height_loss,
     laplacian_smoothing_loss,
     normal_consistency_loss,
     weighted_silhouette_iou_loss,
@@ -813,10 +815,13 @@ def optimize_vertex_offsets(
     Ht, Wt, _scale = _compute_render_resolution(W_orig, H_orig)
     logger.info(
         "Stage 2 setup: N={}, render={}x{}, lr={}, iters={}, "
-        "w_silh={}, w_lap={}, w_nc={}, grad_clip={}",
+        "w_silh={}, w_lap={}, w_nc={}, w_height={}, grad_clip={}, "
+        "target_height={:.2f}m±{:.2f}m",
         N, Wt, Ht, LEARNING_RATE, OPT_MAX_ITERS,
         LOSS_WEIGHTS["silhouette"], LOSS_WEIGHTS["laplacian"],
-        LOSS_WEIGHTS["normal_consistency"], GRAD_CLIP_NORM,
+        LOSS_WEIGHTS["normal_consistency"], LOSS_WEIGHTS["height"],
+        GRAD_CLIP_NORM,
+        stage1_result.height_cm / 100.0, HEIGHT_TOLERANCE_M,
     )
 
     smpl_model = _load_smpl_model(device)
@@ -831,6 +836,14 @@ def optimize_vertex_offsets(
     theta = torch.from_numpy(stage1_result.theta_per_frame).to(device).float().requires_grad_(False)
     cam_t = torch.from_numpy(stage1_result.pred_cam_t_per_frame).to(device).float().requires_grad_(False)
     fl_orig = torch.from_numpy(stage1_result.focal_length_per_frame).to(device).float()
+
+    # v_shape_only is beta-dependent but beta is frozen; compute once outside loop.
+    # Used to re-construct v_canonical = v_template + v_shape_only + delta_v each iter.
+    with torch.no_grad():
+        v_shape_only = smplx.lbs.blend_shapes(
+            beta.unsqueeze(0), smpl_model.shapedirs
+        ).squeeze(0).detach()
+    target_height_m: float = stage1_result.height_cm / 100.0
 
     fl_render = fl_orig / _HMR2_CROP_SIZE * max(Wt, Ht)
     cameras = build_cameras(fl_render, (Ht, Wt), device)
@@ -866,23 +879,27 @@ def optimize_vertex_offsets(
         "silhouette": [],
         "laplacian": [],
         "normal_consistency": [],
+        "height": [],
     }
     LOG_EVERY = 10
 
     w_silh = float(LOSS_WEIGHTS["silhouette"])
     w_lap = float(LOSS_WEIGHTS["laplacian"])
     w_nc = float(LOSS_WEIGHTS["normal_consistency"])
+    w_height = float(LOSS_WEIGHTS["height"])
 
     for it in range(OPT_MAX_ITERS):
         optimizer.zero_grad()
 
+        v_canonical = smpl_model.v_template + v_shape_only + delta_v  # [6890, 3]
         meshes = _pose_meshes(smpl_model, beta, theta, delta_v, cam_t, device)
         alpha = renderer(meshes)[..., 3]                 # [N, Ht, Wt]
 
         L_silh = weighted_silhouette_iou_loss(alpha, target_masks, weight_map)
         L_lap = laplacian_smoothing_loss(meshes)
         L_nc = normal_consistency_loss(meshes)
-        L = w_silh * L_silh + w_lap * L_lap + w_nc * L_nc
+        L_height = height_loss(v_canonical, target_height_m, HEIGHT_TOLERANCE_M)
+        L = w_silh * L_silh + w_lap * L_lap + w_nc * L_nc + w_height * L_height
 
         L.backward()
         torch.nn.utils.clip_grad_norm_([delta_v], max_norm=GRAD_CLIP_NORM)
@@ -892,12 +909,13 @@ def optimize_vertex_offsets(
         per_term_lists["silhouette"].append(float(L_silh.item()))
         per_term_lists["laplacian"].append(float(L_lap.item()))
         per_term_lists["normal_consistency"].append(float(L_nc.item()))
+        per_term_lists["height"].append(float(L_height.item()))
         if it % LOG_EVERY == 0 or it == OPT_MAX_ITERS - 1:
             logger.info(
                 "iter {:3d}: L={:.5f}  silh={:.5f}  lap={:.5f}  nc={:.5f}  "
-                "|ΔV|_max={:.5f}",
+                "height={:.5f}  |ΔV|_max={:.5f}",
                 it, float(L.item()), float(L_silh.item()), float(L_lap.item()),
-                float(L_nc.item()),
+                float(L_nc.item()), float(L_height.item()),
                 float(delta_v.detach().abs().max().item()),
             )
 
@@ -933,6 +951,7 @@ def optimize_vertex_offsets(
         silh_arr = per_term_history["silhouette"]
         lap_weighted_arr = w_lap * per_term_history["laplacian"]
         nc_weighted_arr = w_nc * per_term_history["normal_consistency"]
+        height_weighted_arr = w_height * per_term_history["height"]
 
         fig, ax = plt.subplots(figsize=(8, 5))
         ax.plot(iters, total_arr, label="total", linewidth=2.0, color="black")
@@ -944,6 +963,10 @@ def optimize_vertex_offsets(
         ax.plot(
             iters, nc_weighted_arr,
             label=f"normal_consistency (w={w_nc})", linewidth=1.2, color="tab:green",
+        )
+        ax.plot(
+            iters, height_weighted_arr,
+            label=f"height (w={w_height})", linewidth=1.2, color="tab:red",
         )
         ax.set_xlabel("iteration")
         ax.set_ylabel("loss")

@@ -1,5 +1,5 @@
 """Stage 2 loss terms: silhouette IoU (soft + hard), weighted silhouette IoU,
-Laplacian smoothing, normal consistency."""
+height match, Laplacian smoothing, normal consistency."""
 
 import torch
 from pytorch3d.loss import mesh_laplacian_smoothing, mesh_normal_consistency
@@ -56,6 +56,22 @@ def hard_iou_per_frame(
     inter = (p & t).flatten(1).sum(dim=1).float()
     union = (p | t).flatten(1).sum(dim=1).float() + eps
     return inter / union
+
+
+def height_loss(
+    v_canonical: torch.Tensor,  # [6890, 3]
+    target_height_m: float,
+    tolerance_m: float,
+) -> torch.Tensor:
+    """Squared hinge loss on the mesh Y-span vs user-supplied target height.
+
+    v_canonical is in SMPL canonical T-pose space (+Y up). Y-span = max_y -
+    min_y approximates standing height in meters. Returns zero when the span
+    is within [target - tolerance, target + tolerance]; otherwise (excess)².
+    """
+    y_span = v_canonical[:, 1].max() - v_canonical[:, 1].min()
+    excess = (torch.abs(y_span - target_height_m) - tolerance_m).clamp(min=0.0)
+    return excess * excess
 
 
 def laplacian_smoothing_loss(meshes: Meshes) -> torch.Tensor:
