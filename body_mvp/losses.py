@@ -1,7 +1,8 @@
-"""Stage 2 loss terms: silhouette IoU (soft + hard), Laplacian smoothing."""
+"""Stage 2 loss terms: silhouette IoU (soft + hard), Laplacian smoothing,
+normal consistency."""
 
 import torch
-from pytorch3d.loss import mesh_laplacian_smoothing
+from pytorch3d.loss import mesh_laplacian_smoothing, mesh_normal_consistency
 from pytorch3d.structures import Meshes
 
 
@@ -41,3 +42,8 @@ def hard_iou_per_frame(
 def laplacian_smoothing_loss(meshes: Meshes) -> torch.Tensor:
     """Uniform Laplacian smoothing regularizer (PyTorch3D wrapper)."""
     return mesh_laplacian_smoothing(meshes, method="uniform")
+
+
+def normal_consistency_loss(meshes: Meshes) -> torch.Tensor:
+    """Adjacent-face normal consistency regularizer (PyTorch3D wrapper)."""
+    return mesh_normal_consistency(meshes)

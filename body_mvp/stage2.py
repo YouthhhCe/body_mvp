@@ -25,6 +25,7 @@ from body_mvp.config import (
 from body_mvp.losses import (
     hard_iou_per_frame,
     laplacian_smoothing_loss,
+    normal_consistency_loss,
     silhouette_iou_loss,
 )
 from body_mvp.render import build_cameras, build_silhouette_renderer
@@ -624,9 +625,10 @@ def optimize_vertex_offsets(
     Ht, Wt, _scale = _compute_render_resolution(W_orig, H_orig)
     logger.info(
         "Stage 2 setup: N={}, render={}x{}, lr={}, iters={}, "
-        "w_silh={}, w_lap={}, grad_clip={}",
+        "w_silh={}, w_lap={}, w_nc={}, grad_clip={}",
         N, Wt, Ht, LEARNING_RATE, OPT_MAX_ITERS,
-        LOSS_WEIGHTS["silhouette"], LOSS_WEIGHTS["laplacian"], GRAD_CLIP_NORM,
+        LOSS_WEIGHTS["silhouette"], LOSS_WEIGHTS["laplacian"],
+        LOSS_WEIGHTS["normal_consistency"], GRAD_CLIP_NORM,
     )
 
     smpl_model = _load_smpl_model(device)
@@ -667,11 +669,13 @@ def optimize_vertex_offsets(
     per_term_lists: dict[str, list[float]] = {
         "silhouette": [],
         "laplacian": [],
+        "normal_consistency": [],
     }
     LOG_EVERY = 10
 
     w_silh = float(LOSS_WEIGHTS["silhouette"])
     w_lap = float(LOSS_WEIGHTS["laplacian"])
+    w_nc = float(LOSS_WEIGHTS["normal_consistency"])
 
     for it in range(OPT_MAX_ITERS):
         optimizer.zero_grad()
@@ -681,7 +685,8 @@ def optimize_vertex_offsets(
 
         L_silh = silhouette_iou_loss(alpha, target_masks)
         L_lap = laplacian_smoothing_loss(meshes)
-        L = w_silh * L_silh + w_lap * L_lap
+        L_nc = normal_consistency_loss(meshes)
+        L = w_silh * L_silh + w_lap * L_lap + w_nc * L_nc
 
         L.backward()
         torch.nn.utils.clip_grad_norm_([delta_v], max_norm=GRAD_CLIP_NORM)
@@ -690,11 +695,13 @@ def optimize_vertex_offsets(
         loss_history.append(float(L.item()))
         per_term_lists["silhouette"].append(float(L_silh.item()))
         per_term_lists["laplacian"].append(float(L_lap.item()))
+        per_term_lists["normal_consistency"].append(float(L_nc.item()))
         if it % LOG_EVERY == 0 or it == OPT_MAX_ITERS - 1:
             logger.info(
-                "iter {:3d}: L={:.5f}  silh={:.5f}  lap={:.5f}  "
+                "iter {:3d}: L={:.5f}  silh={:.5f}  lap={:.5f}  nc={:.5f}  "
                 "|ΔV|_max={:.5f}",
                 it, float(L.item()), float(L_silh.item()), float(L_lap.item()),
+                float(L_nc.item()),
                 float(delta_v.detach().abs().max().item()),
             )
 
@@ -729,6 +736,7 @@ def optimize_vertex_offsets(
         total_arr = np.array(loss_history, dtype=np.float32)
         silh_arr = per_term_history["silhouette"]
         lap_weighted_arr = w_lap * per_term_history["laplacian"]
+        nc_weighted_arr = w_nc * per_term_history["normal_consistency"]
 
         fig, ax = plt.subplots(figsize=(8, 5))
         ax.plot(iters, total_arr, label="total", linewidth=2.0, color="black")
@@ -736,6 +744,10 @@ def optimize_vertex_offsets(
         ax.plot(
             iters, lap_weighted_arr,
             label=f"laplacian (w={int(w_lap)})", linewidth=1.2, color="tab:orange",
+        )
+        ax.plot(
+            iters, nc_weighted_arr,
+            label=f"normal_consistency (w={w_nc})", linewidth=1.2, color="tab:green",
         )
         ax.set_xlabel("iteration")
         ax.set_ylabel("loss")
