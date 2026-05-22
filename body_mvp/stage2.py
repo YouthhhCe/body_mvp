@@ -38,6 +38,39 @@ from body_mvp.stage1 import Stage1Result
 # and our M4 render_smpl_overlays (stage1.py:512).
 _HMR2_CROP_SIZE = 256
 
+# --- D7: Region weight infrastructure ---
+#
+# Joints whose *anterior* (canonical z > 0) dominant-weighted vertices form
+# the "belly" region.  Verified from J_regressor @ v_template:
+#   0=pelvis (y=-0.22), 3=spine1 (y=-0.11), 6=spine2 (y=+0.02).
+# Canonical +z is forward/anterior — confirmed empirically (face vertices are
+# at positive z; back-of-head vertices at negative z).
+_BELLY_CANDIDATE_JOINTS: frozenset[int] = frozenset({0, 3, 6})
+
+# Per-dominant-joint silhouette weight. Unlisted joints default to 1.0.
+# Regions susceptible to SAM mask contamination (hair, shoes, sleeves) → 0.2.
+_SILH_WEIGHT_PER_JOINT: dict[int, float] = {
+    12: 0.2, 15: 0.2,   # neck, head  (hair above crown)
+    10: 0.2, 11: 0.2,   # L_foot, R_foot  (shoe edges)
+    22: 0.2, 23: 0.2,   # L_hand, R_hand  (sleeve/glove edges)
+}
+
+# Per-dominant-joint symmetry weight. Unlisted joints default to 1.0.
+# Belly-candidate anterior vertices are overridden to 0.0 (see _build_region_weights).
+_SYM_WEIGHT_PER_JOINT: dict[int, float] = {
+    0: 0.3, 3: 0.3, 6: 0.3,     # pelvis/spine1/spine2 posterior half — lower back
+    9: 0.3, 13: 0.3, 14: 0.3,   # spine3, L_collar, R_collar — upper back
+    1: 0.7, 2: 0.7,              # L_hip, R_hip
+    4: 0.7, 5: 0.7,              # L_knee, R_knee
+    7: 0.7, 8: 0.7,              # L_ankle, R_ankle
+    10: 0.7, 11: 0.7,            # L_foot, R_foot
+    16: 0.7, 17: 0.7,            # L_shoulder, R_shoulder
+    18: 0.7, 19: 0.7,            # L_elbow, R_elbow
+    20: 0.7, 21: 0.7,            # L_wrist, R_wrist
+    22: 0.7, 23: 0.7,            # L_hand, R_hand
+    12: 1.0, 15: 1.0,            # neck, head
+}
+
 
 @dataclass
 class Stage2Result:
@@ -268,6 +301,118 @@ def _load_smpl_model(device: str) -> smplx.SMPL:
         create_transl=False,
     ).to(device).eval()
     return model
+
+
+def _build_region_weights(
+    smpl_model: smplx.SMPL,
+    device: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute per-vertex region weight vectors and the left-right mirror map.
+
+    All three outputs are computed once from the SMPL template and cached as
+    device tensors for use throughout the optimization loop.
+
+    Returns
+    -------
+    silh_region_weights : [6890] float32
+        Per-vertex weight for the silhouette loss.  Head/neck, hands, and feet
+        regions are set to 0.2 (SAM contamination expected); all others 1.0.
+    sym_region_weights : [6890] float32
+        Per-vertex weight for the symmetry loss.  Belly (anterior
+        pelvis/spine1/spine2 dominant, z > 0) = 0.0 to preserve fat
+        asymmetry; posterior spine/back = 0.3; limbs/hands/feet = 0.7;
+        head/neck = 1.0.
+    right_to_left : [6890] int64
+        Mirror index map: right_to_left[i] is vertex i's nearest neighbor in
+        the x-flipped template.  Validated as a near-involution.
+    """
+    v_np = smpl_model.v_template.detach().cpu().numpy().astype(np.float32)  # [6890, 3]
+    lbs_np = smpl_model.lbs_weights.detach().cpu().numpy()                  # [6890, 24]
+    dom = lbs_np.argmax(axis=1)                                             # [6890] int
+    N = v_np.shape[0]
+
+    # --- Silhouette region weights ---
+    silh_w = np.ones(N, dtype=np.float32)
+    for j, w in _SILH_WEIGHT_PER_JOINT.items():
+        silh_w[dom == j] = w
+
+    # --- Symmetry region weights ---
+    sym_w = np.ones(N, dtype=np.float32)
+    for j, w in _SYM_WEIGHT_PER_JOINT.items():
+        sym_w[dom == j] = w
+    # Belly-candidate anterior vertices: override to 0.0.
+    belly_mask = np.isin(dom, sorted(_BELLY_CANDIDATE_JOINTS)) & (v_np[:, 2] > 0.0)
+    sym_w[belly_mask] = 0.0
+
+    # --- Per-region vertex count stats ---
+    regions: dict[str, np.ndarray] = {
+        "belly":       belly_mask,
+        "pelvis_back": np.isin(dom, sorted(_BELLY_CANDIDATE_JOINTS)) & ~belly_mask,
+        "upper_back":  np.isin(dom, [9, 13, 14]),
+        "head_neck":   np.isin(dom, [12, 15]),
+        "arms":        np.isin(dom, [16, 17, 18, 19, 20, 21]),
+        "hands":       np.isin(dom, [22, 23]),
+        "legs":        np.isin(dom, [1, 2, 4, 5, 7, 8]),
+        "feet":        np.isin(dom, [10, 11]),
+    }
+    total_accounted = sum(int(m.sum()) for m in regions.values())
+    if total_accounted != N:
+        raise RuntimeError(
+            f"Region partition covers {total_accounted} vertices, expected {N}"
+        )
+    logger.info("D7 region vertex counts (total={}):", N)
+    for name, mask in regions.items():
+        logger.info("  {:12s}: {:4d}", name, int(mask.sum()))
+
+    # --- Left-right mirror map via nearest-neighbour in x-flipped template ---
+    v_mirror = v_np * np.array([-1.0, 1.0, 1.0], dtype=np.float32)
+    v_t = torch.from_numpy(v_np)                   # [6890, 3]  CPU float32
+    vm_t = torch.from_numpy(v_mirror)              # [6890, 3]  CPU float32
+    dists = torch.cdist(v_t, vm_t)                 # [6890, 6890]
+    right_to_left = dists.argmin(dim=1).to(torch.int64)  # [6890]
+
+    # --- Involution gate: zero sym_w for non-involution vertices ---
+    # SMPL's template is not vertex-level bilaterally symmetric; ~6.8% of
+    # vertices have no clean mirror partner (diagnosed: half are in the outer
+    # arms/hands where left/right triangulations differ slightly). These
+    # vertices should not participate in the symmetry loss because the premise
+    # "i and right_to_left[i] are mirror partners" doesn't hold for them.
+    arange = torch.arange(N, dtype=torch.int64)
+    double_mirror = right_to_left[right_to_left]
+    involution_mask_t = (double_mirror == arange)           # [6890] bool tensor
+    involution_mask   = involution_mask_t.numpy()           # [6890] bool numpy
+
+    pair_dists = torch.norm(v_t - vm_t[right_to_left], dim=1)
+    max_pair_dist = float(pair_dists.max().item())
+    n_far_pairs   = int((pair_dists > 0.01).sum().item())
+
+    n_non_invol       = int((~involution_mask_t).sum().item())
+    n_zeroed_by_gate  = int(((sym_w > 0) & ~involution_mask).sum())
+    sym_w[~involution_mask] = 0.0
+
+    n_sym_constrained = int((sym_w > 0).sum())
+    logger.info(
+        "D7 mirror map: non_involution={}, zeroed_by_gate={}, "
+        "sym_constrained_after_gate={}/{}, "
+        "max_pair_dist={:.5f} m, pairs_over_1cm={}",
+        n_non_invol, n_zeroed_by_gate, n_sym_constrained, N,
+        max_pair_dist, n_far_pairs,
+    )
+
+    # Hard invariant: every vertex with sym_weight > 0 must be a valid
+    # involution pair. This should always hold after the zeroing above.
+    n_fail_post_gate = int(((sym_w > 0) & ~involution_mask).sum())
+    if n_fail_post_gate != 0:
+        raise RuntimeError(
+            f"D7 invariant violated: {n_fail_post_gate} vertices have "
+            f"sym_weight > 0 but are not valid involution pairs"
+        )
+
+    return (
+        torch.from_numpy(silh_w).to(device),
+        torch.from_numpy(sym_w).to(device),
+        right_to_left.to(device),
+    )
 
 
 def _pose_meshes(
@@ -632,6 +777,9 @@ def optimize_vertex_offsets(
     )
 
     smpl_model = _load_smpl_model(device)
+    silh_region_weights, sym_region_weights, right_to_left = _build_region_weights(
+        smpl_model, device
+    )
 
     # Detached pass-through tensors from Stage 1. torch.from_numpy + .to()
     # produces requires_grad=False by default, but make it explicit so a
