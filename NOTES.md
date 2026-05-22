@@ -60,95 +60,87 @@ Running log of decisions, parameter experiments, and open questions. See CLAUDE.
 
 ---
 
-## 2026-05-19 — M4 third_party setup (user-driven)
+## 2026-05-19 — M4 SMPL β/θ via 4D Humans (user-driven setup)
 
-**Done:** 4D Humans (`shubham-goel/4D-Humans` @ `efe18de`) cloned to `third_party/`, installed `--no-deps`, audited setup.py manually. SMPL v1.0.0 neutral placed and symlinked into hmr2's expected cache path. End-to-end forward pass verified.
+**Done:** 4D Humans (`shubham-goel/4D-Humans` @ `efe18de`) cloned to `third_party/`, installed `--no-deps` with setup.py audited manually. SMPL v1.0.0 neutral placed + symlinked into hmr2's cache path. `extract_smpl_params` and `render_smpl_overlays` implemented in `stage1.py` — 12 .npz + 12 overlay PNGs. Not integrated into `pipeline.run()` (M6's job). Acceptance reproduced on a second LAN server.
 
 **Decisions:**
-- **User does this milestone's setup, not CC.** Multi-variable env stabilization (repo state, dep audit, torch compat, checkpoint paths, SMPL version) is CC's weak spot. Tagged `m3-end` before starting as a future CC capability replay.
+- **User did this milestone's setup, not CC.** Multi-variable env stabilization (repo state, dep audit, torch compat, checkpoint paths) is CC's weak spot. Tagged `m3-end` before starting.
 - Skipped `[all]` extras (detectron2 ~4 GB). hmr2 called directly; person bbox from SAM mask (interim) → RTMPose (M5+).
-- SMPL v1.0.0 over v1.1.0: v1.1.0's dynamic blendshapes are unused by hmr2; v1.0.0 is what the README expects.
-- hmr2 outputs rotation matrices; convert to axis-angle via `pytorch3d.transforms.matrix_to_axis_angle` to match data contract `theta: [24, 3]`.
-
-**Surprises:**
-- `hmr2_data.tar.gz` from UT Austin silently truncated at 352 MB (full ~1.1 GB+); `download_models()` has no integrity check. Recovery: pulled ckpt + config from HuggingFace Space `brjathu/HMR2.0`.
-
-**Env name correction:** `dyc_bodymvp` (HANDOFF M3 wrote `bodymvp`).
-
----
-
-## 2026-05-19 — M4 implementation + cross-machine migration
-
-**Done:** `extract_smpl_params` and `render_smpl_overlays` in `stage1.py`. 12 .npz + 12 overlay PNGs. Not integrated into `pipeline.run()` — M6's job. Acceptance reproduced on a second LAN server (same RTX 3090, Ubuntu 20.04).
-
-**Decisions:**
+- SMPL **v1.0.0** over v1.1.0: v1.1.0's dynamic blendshapes are unused by hmr2; v1.0.0 is what the README expects.
+- hmr2 outputs **rotation matrices**; convert to axis-angle via `pytorch3d.transforms.matrix_to_axis_angle` to match data contract `theta: [24, 3]`.
 - Per-frame betas saved as-is; averaging deferred to M6.
-- Bbox source per frame: SAM mask bbox when coverage ≥ 8% (8 frames), else heuristic center-crop fallback (4 frames). 8% threshold from M3 data.
-- `render_smpl_overlays` is a separate `.npz` reader, not called by pipeline. Decouples inference success from rendering env fragility.
-- Stored 4 extra .npz fields (pred_cam, pred_cam_t, focal_length, bbox + bbox_source) — free outputs from hmr2 forward; avoids re-running inference in M6/M9.
+- **Stored 4 extra .npz fields** (`pred_cam`, `pred_cam_t`, `focal_length`, `bbox` + `bbox_source`) — free outputs from hmr2 forward; avoids re-running inference in M6/M7/M9. (M7 consumes `pred_cam_t` + `focal_length` for camera setup.)
+- `render_smpl_overlays` is a standalone `.npz` reader, not pipeline-called — decouples inference success from rendering env fragility.
 
-**Surprises:**
-- Migration revealed setup-doc gaps: pytorch3d wheel URL pattern, SAM 2 install ordering, chumpy `--no-build-isolation`, pyrender mandatory even for inference-only paths. Consolidated into `MIGRATION_GUIDE.md`.
-- Found M1 scaffolding bug: `pyproject.toml` listed `sam2 @ git+...` but PyPI metadata declares `sam-2` (hyphenated); editable install failed. Fixed by removing the line.
-
-**Known debt:** M3 mask debt unchanged (deferred to post-M5). `pipeline.run()` still stub — M6 territory.
-
-**Migration food for thought (future):** Docker / `conda-pack` + rsync / a more thorough `download_models.sh`. Out of scope until shipping.
+**Carried over:** cross-machine migration surfaced setup-doc gaps (pytorch3d wheel URL, SAM 2 install ordering, chumpy `--no-build-isolation`, pyrender mandatory) — all consolidated into `MIGRATION_GUIDE.md`. Fixed M1 bug: `pyproject.toml` `sam2` line removed (PyPI metadata uses hyphenated `sam-2`, broke editable install). Env name is `dyc_bodymvp`.
 
 ---
 
 ## 2026-05-20 — M5 keypoints + normals + M3 mask debt fix
 
-**Done:** `extract_keypoints`, `_keypoints_to_bbox`, `refine_masks_with_keypoints`, `extract_normals` + their overlay tools in `stage1.py`. M5 acceptance passed on run `20260519_215818` (12 keypoint .npz + 12 normal .npz + overlays). M3 mask debt resolved — 4 side-view frames re-run with keypoint-derived bbox; old SAM scores 0.22–0.35 → new 0.92–0.97. M3 milestone ticked complete.
+**Done:** `extract_keypoints`, `_keypoints_to_bbox`, `refine_masks_with_keypoints`, `extract_normals` + overlay tools in `stage1.py`. M5 acceptance passed. M3 mask debt resolved — 4 side-view frames re-run with keypoint-derived bbox (SAM scores 0.22–0.35 → 0.92–0.97); M3 ticked complete.
 
 **Decisions:**
-- **Mask-failure detection criterion: single `coverage < 9%`.** Run data showed a clean 4.4-pp gap (good 11.3–14.6%, failed 4.2–6.9%). A 2-of-3 voting alternative was proposed but rejected per CLAUDE.md "no future-flexibility layers".
-- **RTMPose: rtmlib `Body` 'balanced' mode** (yolox-m + rtmpose-m body7, ONNX). Lightweight's yolox-tiny at 416×416 is a real risk on side views; performance's yolox-x adds ~400 MB without buying anything.
-- **Sapiens-Normal: 0.3B torchscript.** Tried 1B → OOM on RTX 3090 (>24 GB peak); 0.6B fits at 18.9 GB but only 5.4 GB headroom — too tight for M7+ when PyTorch3D rendering adds VRAM pressure; 0.3B at ~14.1 GB peak leaves ~10.3 GB headroom. Activation memory dominates over parameter count at 1024×768, so going smaller doesn't help much. License: Sapiens License (non-commercial), consistent with 4D Humans / SMPL.
-- **Sapiens preprocess is NOT standard ImageNet:** BGR (no swap from `cv2.imread`), pixels in 0–255 (no /255), `mean=[123.5,116.5,103.5]`, `std=[58.5,57.0,57.5]`. Input `[1,3,1024,768]`, output is half-resolution `[1,3,512,384]` — upsample before applying mask. Numerics codified in `_SAPIENS_*` module constants.
-- **Sapiens output is in CAMERA frame, not world.** Aligning to SMPL/world is M8 work. Stored normals are RAW (mean magnitudes 0.95–0.97, not unit).
-- **Feed FULL keyframe to Sapiens, not a person crop** — cropping degrades quality even with generous padding (per Sapiens-Pytorch-Inference project notes). Background zeroed post-inference using SAM mask.
+- **Mask-failure detection: single `coverage < 9%`.** Run data showed a clean 4.4-pp gap (good 11.3–14.6%, failed 4.2–6.9%). 2-of-3 voting alternative rejected per CLAUDE.md "no future-flexibility layers".
+- **RTMPose: rtmlib `Body` 'balanced' mode** (yolox-m + rtmpose-m body7, ONNX). yolox-tiny risks side views; yolox-x adds ~400 MB for no gain.
+- **Sapiens-Normal: 0.3B torchscript.** 1B → OOM on RTX 3090; 0.6B fits at 18.9 GB but leaves only 5.4 GB headroom (too tight for M7+ PyTorch3D rendering); 0.3B at ~14.1 GB peak leaves ~10.3 GB. Activation memory dominates over param count at 1024×768, so going smaller buys little. License: Sapiens (non-commercial).
+- **Sapiens preprocess is NOT standard ImageNet** — BGR, pixels 0–255, custom mean/std, half-res output. Numerics codified in `_SAPIENS_*` constants in code.
+- **Sapiens output is in CAMERA frame, RAW (non-unit).** Aligning to SMPL/world is M8 work — prerequisite for M8's normal loss.
+- **Feed FULL keyframe to Sapiens, not a person crop** — cropping degrades quality. Background zeroed post-inference via SAM mask.
 
 **Surprises:**
-- **VRAM measurement discrepancy on Sapiens 0.3B:** smoke test showed ~14.1 GB peak (nvidia-smi during JIT warmup); inference loop showed 2.72 GB (`torch.cuda.max_memory_allocated()`, post-warmup). The numbers measure different things. Steady-state is ~3 GB; use the 14.1 GB figure for M7/M8 budgeting since first-forward JIT warmup recurs whenever model is loaded in a fresh process.
-- **Plan-doc misstatement caught mid-execution:** approved plan claimed rtmlib's default detector is "YOLOX-Nano-Person (~12 MB)". Reading rtmlib source mid-task: no Nano variant exists; the smallest is YOLOX-tiny at ~18 MB. Pattern to remember: don't write package internals from memory in approved plans; verify against source first.
+- **VRAM has two readings:** ~14.1 GB peak (`nvidia-smi`, includes JIT warmup) vs 2.72 GB steady-state (`max_memory_allocated`, post-warmup). Budget with the 14.1 GB figure — fresh-process warmup recurs on every load. (Codified as HANDOFF rule.)
 
 **Open questions:**
-- COCO-17 → SMPL 24 joint mapping for Stage 2 reprojection loss: standard answer is fixed mapping (shoulders, elbows, wrists, hips, knees, ankles); face keypoints have no SMPL analogue. Defer to M7.
-- Boxer-shorts printed pattern gets segmented as background by SAM, zeroing normals there. Small area, won't materially affect Stage 2. If it bites later: dilate SAM mask before zeroing.
-
-**Next:** M6 — `pipeline.run()` end-to-end. Aggregate keyframes + masks + SMPL + keypoints + normals into a unified `Stage1Result`, persist to disk, verify load-from-disk in REPL.
+- COCO-17 → SMPL-24 joint mapping for Stage 2 reprojection loss: standard answer is fixed mapping (shoulders/elbows/wrists/hips/knees/ankles); face keypoints have no SMPL analogue. Deferred to M8.
+- Boxer-shorts printed pattern gets segmented as background by SAM, zeroing normals there. Small area. If it bites: dilate SAM mask before zeroing.
 
 ---
 
 ## 2026-05-21 — M6 Stage 1 end-to-end (option c + SAM box+points)
 
-**Done:** `pipeline.run()` runs Stage 1 end-to-end and persists `Stage1Result` to `<run_dir>/stage1_result.npz`. `Stage1Result` is a dataclass with `__post_init__` invariants and `save/load` (native numpy dtypes, no pickle). Round-trip self-check fires on every run. Acceptance on `data/runs/20260521_132028/` — all 12 masks visually correct, β stable to 3 dp across two consecutive runs.
+**Done:** `pipeline.run()` runs Stage 1 end-to-end, persists `Stage1Result` to `<run_dir>/stage1_result.npz`. `Stage1Result` is a dataclass with `__post_init__` invariants + `save/load` (native numpy dtypes, no pickle); round-trip self-check fires every run. Acceptance on `data/runs/20260521_132028/` — all 12 masks correct, β stable to 3 dp across two runs.
 
 **Decisions:**
-- **Option (c): YOLOX bbox as single source of truth, shared by SAM and hmr2.** Eliminated the `_make_box_prompt` / `_mask_to_bbox` / `refine_masks_with_keypoints` dead-code path rather than keeping brittle gates. Diagnostic origin: M4 used heuristic fallback bbox on 4 side-view frames; M5 fixed masks but never re-ran SMPL — disagreement between SAM and SMPL about person location.
-- **`theta_per_frame: [N, 24, 3]` merged in Stage1Result; smpl_NN.npz keeps hmr2's split layout.** 24-joint is the data contract; hmr2's split is upstream layout. Merge only at construction site.
-- **β = per-component mean across keyframes.** `betas_per_frame` preserved for future re-aggregation (medoid / IQR-trimmed) without re-inference.
-- **`stage1_result.npz` is metadata-only; pixel data via path references.** Round-trip self-check cheap enough to run every invocation.
-- **`bbox_source == "none"` gate after extract_keypoints**: YOLOX failure raises with offender list; no silent fallback. That heuristic-fallback IS the bug option (c) fixes.
-
-**SAM regression (resolved):** Wide YOLOX bbox (>80% image width) + person in narrow vertical strip → SAM's three multimask candidates all scored < 0.30 with the argmax often inverted (frames 06, 11). Fix: combine box with positive torso-keypoint points (COCO 0/5/6/11/12, score gate 0.5, fail-loud if <2 survive). Post-fix all 12 frames score 0.938–0.953. Captured as PROJECT.md pitfall #8.
+- **Option (c): YOLOX bbox is the single source of truth**, shared by SAM and hmr2. Eliminated the `_make_box_prompt` / `_mask_to_bbox` / `refine_masks_with_keypoints` dead-code path. Origin: M4 used heuristic fallback bbox on 4 side-view frames; M5 fixed masks but never re-ran SMPL — SAM and SMPL disagreed on person location.
+- **`theta_per_frame: [N, 24, 3]`** merged in Stage1Result uses the 24-joint convention (joint 0 = global_orient, 1–23 = body_pose); per-frame `smpl_NN.npz` keeps hmr2's split layout. Merge only at construction.
+- **β = per-component mean across keyframes.** `betas_per_frame` preserved for future re-aggregation without re-inference.
+- **`stage1_result.npz` is metadata-only**; pixel data via path references.
+- **`bbox_source == "none"` gate** after extract_keypoints: YOLOX failure raises with offender list, no silent fallback.
+- **SAM prompted with box + torso-keypoint positive points** (COCO 0/5/6/11/12, score gate 0.5) — resolves the wide-bbox foreground/background inversion ambiguity. Captured as PROJECT.md pitfall #8.
 
 **Surprises:**
-- **Sapiens-Normal magnitude outliers (6.42, 6.88) were downstream of the SAM inversion**, not a Sapiens artifact. `extract_normals` multiplies Sapiens output by mask; inverted mask zeroed the wrong region. After SAM fix: 1.07, 1.14. Generalization worth carrying: anomalies on the same frames often share an upstream cause.
-- **SAM score is not a per-frame mask quality signal.** Pre-fix, 4 visually-clean masks scored 0.40–0.54. Score reflects prompt-information sufficiency, not mask correctness. Stage 2's silhouette loss must NOT weight per-frame by SAM score.
-
-**M7 must read — removed from `pipeline.run()`:**
-- `stage2.run()` and `stage3.run()` calls removed (M1 stubs). **M7 must wire `stage2.run()` back into `pipeline.run()`** after the optimization loop is implemented, taking Stage1Result as input.
-
-**Production backlog (don't act on now):**
-- If box+points ever fails on a future frame, try `multimask_output=False` (per SAM 2 docs for multi-prompt cases) before adding fallback chains.
-- `>= 2 torso points` rule doesn't enforce geometry. If masks ever bias upper/lower body, require `>= 1 shoulder AND >= 1 hip`.
-- See Surprises re: SAM score and Stage 2 silhouette weighting.
+- **SAM score is not a mask-quality signal.** Visually-clean masks scored as low as 0.40; score reflects prompt-information sufficiency, not correctness. **Stage 2's silhouette loss must NOT weight per-frame by SAM score.**
+- Anomalies on the same frames often share an upstream cause — Sapiens magnitude outliers turned out to be downstream of the SAM inversion, not a Sapiens artifact.
 
 **Open questions:**
-- `_MASK_COVERAGE_THRESHOLD` and `_MASK_REFINE_COVERAGE_THRESHOLD` are now unused by the pipeline. Add "no longer pipeline-called" comment on the next stage1.py drive-by.
-- Boxer-shorts pattern still segmented as background by SAM (M5 carryover, unchanged by box+points).
-- `hmr2/datasets/vitdet_dataset.py:62` stray `print(f'{downsampling_factor=}')` — don't patch third_party.
+- `_MASK_COVERAGE_THRESHOLD` / `_MASK_REFINE_COVERAGE_THRESHOLD` now unused by the pipeline — annotate on next stage1.py drive-by.
+- Boxer-shorts pattern still segmented as background by SAM (M5 carryover).
+- `hmr2/datasets/vitdet_dataset.py:62` stray `print` — don't patch third_party.
 
-**Next:** M7 — Stage 2 minimal optimization. ΔV loop + silhouette loss + basic regularizer. First task: wire `stage2.run()` back into `pipeline.run()`.
+---
+
+## 2026-05-22 — M7 Stage 2 minimal optimization
+
+**Done:** Test-time ΔV optimization runs end-to-end. `render.py` and `losses.py` fleshed out (PyTorch3D `PerspectiveCameras` + `MeshRasterizer`/`SoftSilhouetteShader`; soft-IoU loss + uniform Laplacian smoothing). `stage2.py` is the core: `_pose_meshes`, `Stage2Result` (+save/load/round-trip), `optimize_vertex_offsets`, `save_silhouette_debug`, dev-only sanity renders. `stage2.run()` wired into `pipeline.run()` (now returns `tuple[Stage1Result, Stage2Result]`). Acceptance met on `data/runs/20260522_001631/`: loss 0.476→0.260 monotone over 200 iters, max|ΔV|=0.156, mean hard-IoU 0.780→0.884 (+0.10), all 12 frames improved. Wall ~6.6 s, peak VRAM ~0.5 GB.
+
+**Decisions:**
+- **ΔV path calls `smplx.lbs.lbs()` directly**, bypassing smplx's high-level forward. `v_canonical = v_template + blend_shapes(β) + ΔV`, then LBS per frame with detached θ. Monkey-patching `v_template` was rejected — it's a registered buffer, not a Parameter, so gradient would not flow to ΔV. β and θ_per_frame are `requires_grad=False`; ΔV is the only `nn.Parameter` (zero-init `[6890,3]`).
+- **Camera transform reuses M4's path, with two corrections grounded in source** (not derived): (1) hmr2's `focal_length` is in **256-crop space** (raw 5000), so render-space focal = `fl / 256 * max(Wt, Ht)`. (2) **No R_180x flip** — hmr2's predicted `global_orient` already carries the image-frame adaptation (frame-0 ≈ 178° about X); PyTorch3D `in_ndc=False` has no OpenGL framebuffer flip to compensate for, unlike the pyrender path. `verts_world = verts_posed + pred_cam_t`, no axis flip. **M9's A-pose render reuses this exact camera path.** The "obvious" R_180x flip from hmr2's pyrender path is the trap.
+- **Knobs locked, deliberately minimal** (in `config.py`): lr 1e-3, grad-clip-norm 1.0, 200 iters fixed, silhouette weight 1.0, uniform Laplacian weight 100.0. Pitfall #3 (explosion) defense is **grad clip + low lr only** — no lr schedule, early stop, patience, or recovery branches. M8 owns tuning.
+- **`final_loss` persisted as float64, `loss_history` as float32.** Round-trip self-check is bit-exact, not `isclose`; float32 `final_loss` failed the exact compare. Everything else native numpy dtype, `allow_pickle=False`.
+- **`save_silhouette_debug` is self-contained** — re-renders both the ΔV=0 baseline and optimized ΔV rather than copying from sanity outputs, removing an implicit ordering dependency in `pipeline.run`. `sanity_render_*` stay dev-only, NOT pipeline-called.
+- matplotlib added (for loss curves; amortized for M8's multi-loss plots) — see `requirements_frozen.txt`.
+
+**Surprises / memory aids for M8/M9:**
+- **Mask-driven artifacts in final overlays (M7-expected, NOT a bug).** ΔV pulls vertices to match SAM mask boundaries that include hair / shoes / clothing edges, producing visible surface spikes. Silhouette IoU is semantically blind; uniform Laplacian can't tell "real body edge" from "hair edge". Concrete motivation for **M8's part-aware silhouette weighting + normal loss**.
+- **Frame 09 (raised/forward arm) had the smallest IoU gain (+0.04).** Silhouette alone cannot fix a limb-*pose* mismatch — moving vertices in canonical space can't relocate a posed arm. **M8's keypoint reprojection loss is the intended remedy; flag frame 09 as an M8 test case.**
+- **Peak VRAM ~0.5 GB**, far under the 1.2–1.5 GB pre-estimate. M8 has large headroom to raise render resolution / `faces_per_pixel` / add loss terms.
+- **Duplicate SMPL load** — Stage 2 loads its own `smplx.SMPL` while hmr2 already loaded a structurally-compatible model in Stage 1. Fine for M7 (~0.3 s). Candidate for a single shared model once M8/M9 both need it.
+
+**Open questions:**
+- COCO-17 → SMPL-24 joint mapping for M8's keypoint reprojection loss still unresolved (carried from M5).
+- Whether uniform Laplacian is enough regularization once M8's stronger silhouette pull lands, or whether `mesh_normal_consistency` is needed.
+
+**Next:** M8 — Stage 2 full loss + tuning. Enable normal-map agreement, keypoint reprojection, height match, part-aware terms; tune weights on the test video. Longest milestone.

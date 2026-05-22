@@ -228,7 +228,7 @@ Each stage lives in a single file by design. `body_mvp/` is a flat package, not 
   - Goal: unified `Stage1Result` produced from a single CLI run, saved to disk
   - Acceptance: can load `Stage1Result` from disk in a REPL and inspect all fields
 
-- [ ] **M7 — Stage 2 minimal optimization**
+- [x] **M7 — Stage 2 minimal optimization**
   - Goal: ΔV optimization loop runs with just silhouette loss (+ basic regularizer)
   - Acceptance: loss decreases over iterations; final ΔV is non-zero; mesh silhouette visibly closer to mask than initial SMPL
 
@@ -268,29 +268,15 @@ Things that have bitten others working on similar pipelines:
 
 ## Current status
 
-M6 complete. `pipeline.run()` now runs Stage 1 end-to-end on a fresh `run_id` per invocation, producing a single `Stage1Result` (dataclass) persisted as `<run_dir>/stage1_result.npz` alongside the per-sub-task debug artifacts. A round-trip load self-check runs every pipeline invocation and raises on any drift.
+M7 complete. `pipeline.run()` now runs Stage 1 **and** Stage 2, returning `(Stage1Result, Stage2Result)`. Stage 2 is a test-time optimization of the per-vertex offset ΔV `[6890, 3]` in canonical T-pose space, supervised by a single silhouette IoU loss against the SAM masks plus a Laplacian smoothing regularizer. ΔV is the only optimized parameter; β and per-frame θ are frozen. `Stage2Result` (`delta_v`, frozen β/θ, loss history, per-frame init/final IoU) is persisted as `<run_dir>/stage2_result.npz` with a bit-exact round-trip self-check; before/after silhouette overlays and a loss curve land in `<run_dir>/stage2/`.
 
-Architectural decisions baked in by M6:
-- **Option (c) bbox plumbing:** RTMPose's YOLOX detector runs first; its per-frame XYXY bbox is the single source of truth for "where is the person", shared by both SAM 2 and 4D Humans (hmr2). `refine_masks_with_keypoints` from M5 is no longer pipeline-called; its purpose is subsumed by SAM having a good bbox from the start.
-- **SAM 2 prompted with box + torso-keypoint positive points** (COCO indices 0, 5, 6, 11, 12) to resolve the wide-bbox foreground/background inversion ambiguity. See Implementation pitfalls #8.
-- **β aggregation:** per-component mean across the 12 keyframes. Per-frame betas preserved alongside in `Stage1Result.betas_per_frame` for future re-aggregation without re-inference.
-- **`theta_per_frame: [N, 24, 3]`** in `Stage1Result` uses the 24-joint convention (joint 0 = global_orient, 1–23 = body_pose); the underlying per-frame `smpl_NN.npz` keeps the split hmr2 layout unchanged.
+Architectural decisions baked in by M7:
+- **ΔV → posed mesh calls `smplx.lbs.lbs()` directly**, with ΔV added into the canonical mesh (`v_canonical = v_template + blend_shapes(β) + ΔV`) before per-frame LBS.
+- **Camera path follows M4's, with two corrections**: hmr2's `focal_length` is in 256-crop space (rescaled by `max(Wt,Ht)/256`), and no R_180x flip is applied. M9's A-pose render reuses this path. See NOTES 2026-05-22 for the derivation.
+- **Hyperparameters (lr, weights, iters, grad-clip) live in `config.py`**; M7 uses a deliberately minimal loop (no lr schedule / early stop / recovery branches). Tuning is M8.
+- **M7 is silhouette-only**: silhouette IoU is semantically blind, so the final mesh does not correct hair / shoe / clothing-edge contamination or limb-pose mismatch. Those are M8's scope.
 
-`pipeline.run()` no longer calls `stage1.run` / `stage2.run` / `stage3.run` stubs. M7 must wire `stage2.run()` back in when the optimization loop is implemented.
-
-Latest end-to-end run: `data/runs/20260521_132028/` on `test.mp4` — all 12 masks visually correct, β stable across two consecutive runs to 3 decimal places, round-trip self-check passes. Next: M7.
-
-Environment (verified reproducible on a second LAN server; see `MIGRATION_GUIDE.md`):
-- Conda env `dyc_bodymvp` (Python 3.10)
-- PyTorch 2.4.1 + CUDA 12.1, GPU-verified (RTX 3090)
-- PyTorch3D 0.7.8, GPU-verified
-- SAM 2 (`facebookresearch/sam2` @ `2b90b9f5`) — git+pip `--no-deps`
-- 4D Humans (`shubham-goel/4D-Humans` @ `efe18de`) in `third_party/`, installed with `pip install -e . --no-deps`
-- rtmlib 0.0.15 (`--no-deps`) + onnxruntime-gpu 1.19.2 (CUDA 12, cuDNN 9)
-- chumpy (`mattloper` @ `580566ea`), pytorch-lightning 2.6.1, pyrender, scikit-image, timm, einops (full list in `requirements_frozen.txt`)
-- Project installed as editable package via `pip install -e .`
-
----
+Latest end-to-end run: `data/runs/20260522_001631/` on `test.mp4` — loss decreased monotonically, final ΔV non-zero, mean per-frame IoU improved on all 12 keyframes, both round-trip self-checks pass. Next: M8.
 
 ## Out of scope for MVP
 

@@ -1,5 +1,5 @@
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -71,6 +71,12 @@ class Stage2Result:
     initial_iou_per_frame: np.ndarray  # [N] float32
     final_iou_per_frame: np.ndarray    # [N] float32
 
+    # Raw (pre-weight) per-term loss history. Keys e.g. "silhouette",
+    # "laplacian"; each value is [T] float32. Empty dict is valid (no
+    # per-term breakdown was recorded). Drives M8 cross-run tuning
+    # comparison — total loss_history alone hides which term is moving.
+    per_term_history: dict[str, np.ndarray] = field(default_factory=dict)
+
     def __post_init__(self) -> None:
         if self.n_iterations <= 0:
             raise ValueError(f"n_iterations: must be > 0, got {self.n_iterations}")
@@ -99,17 +105,46 @@ class Stage2Result:
                 f"loss_history length {T} != n_iterations {self.n_iterations}"
             )
 
+        for name, arr in self.per_term_history.items():
+            # "__" is the npz flatten/un-flatten prefix separator; disallow
+            # it in user-facing key names so save/load can't ambiguously
+            # parse the field.
+            if "__" in name:
+                raise ValueError(
+                    f"per_term_history key {name!r}: double-underscore is reserved"
+                )
+            if not isinstance(arr, np.ndarray):
+                raise TypeError(
+                    f"per_term_history[{name!r}]: expected ndarray, got {type(arr)}"
+                )
+            if arr.shape != (self.n_iterations,):
+                raise ValueError(
+                    f"per_term_history[{name!r}]: expected shape "
+                    f"({self.n_iterations},), got {tuple(arr.shape)}"
+                )
+            if arr.dtype != np.float32:
+                raise ValueError(
+                    f"per_term_history[{name!r}]: expected float32, got {arr.dtype}"
+                )
+
+
+_PER_TERM_PREFIX = "per_term__"
+
 
 def save_stage2_result(result: Stage2Result, path: Path) -> None:
     """Write Stage2Result to a single .npz at `path`. Mirrors save_stage1_result:
-    native dtypes, no pickle, strings as 0-d unicode arrays, paths as str."""
+    native dtypes, no pickle, strings as 0-d unicode arrays, paths as str.
+
+    per_term_history is flattened into `per_term__<name>` keys so np.savez
+    (no dict support) and allow_pickle=False (no pickle on load) both stay
+    happy. load_stage2_result reconstructs the dict by prefix-stripping.
+    """
     assert path.suffix == ".npz", (
         f"save_stage2_result: path must end in .npz to match np.savez's own "
         f"behavior (it silently appends .npz otherwise, desyncing the file "
         f"path the caller thinks they wrote). Got: {path}"
     )
-    np.savez(
-        str(path),
+    save_kwargs: dict[str, np.ndarray] = dict(
         run_id=np.array(result.run_id),
         run_dir=np.array(str(result.run_dir)),
         delta_v=result.delta_v.astype(np.float32),
@@ -124,12 +159,25 @@ def save_stage2_result(result: Stage2Result, path: Path) -> None:
         initial_iou_per_frame=result.initial_iou_per_frame.astype(np.float32),
         final_iou_per_frame=result.final_iou_per_frame.astype(np.float32),
     )
+    for name, arr in result.per_term_history.items():
+        key = f"{_PER_TERM_PREFIX}{name}"
+        if key in save_kwargs:
+            raise ValueError(
+                f"per_term_history key {name!r} collides with reserved field {key!r}"
+            )
+        save_kwargs[key] = arr.astype(np.float32)
+    np.savez(str(path), **save_kwargs)
 
 
 def load_stage2_result(path: Path) -> Stage2Result:
     """Inverse of save_stage2_result. allow_pickle=False is safe — every
     field is stored as a native numpy dtype."""
     data = np.load(str(path), allow_pickle=False)
+    per_term_history: dict[str, np.ndarray] = {
+        key[len(_PER_TERM_PREFIX):]: data[key]
+        for key in data.files
+        if key.startswith(_PER_TERM_PREFIX)
+    }
     return Stage2Result(
         run_id=str(data["run_id"].item()),
         run_dir=Path(str(data["run_dir"].item())),
@@ -141,6 +189,7 @@ def load_stage2_result(path: Path) -> Stage2Result:
         loss_history=data["loss_history"],
         initial_iou_per_frame=data["initial_iou_per_frame"],
         final_iou_per_frame=data["final_iou_per_frame"],
+        per_term_history=per_term_history,
     )
 
 
@@ -174,6 +223,28 @@ def _verify_stage2_round_trip(original: Stage2Result, path: Path) -> None:
             raise RuntimeError(f"round-trip dtype mismatch on {name}: {a.dtype} vs {b.dtype}")
         if not np.array_equal(a, b):
             raise RuntimeError(f"round-trip value mismatch on {name}")
+
+    orig_pt = original.per_term_history
+    loaded_pt = loaded.per_term_history
+    if set(orig_pt.keys()) != set(loaded_pt.keys()):
+        raise RuntimeError(
+            f"round-trip per_term_history key-set mismatch: "
+            f"original={sorted(orig_pt)} loaded={sorted(loaded_pt)}"
+        )
+    for name in orig_pt:
+        a, b = orig_pt[name], loaded_pt[name]
+        if a.shape != b.shape:
+            raise RuntimeError(
+                f"round-trip shape mismatch on per_term_history[{name!r}]: "
+                f"{a.shape} vs {b.shape}"
+            )
+        if a.dtype != b.dtype:
+            raise RuntimeError(
+                f"round-trip dtype mismatch on per_term_history[{name!r}]: "
+                f"{a.dtype} vs {b.dtype}"
+            )
+        if not np.array_equal(a, b):
+            raise RuntimeError(f"round-trip value mismatch on per_term_history[{name!r}]")
 
     logger.info("stage2_result.npz round-trip self-check passed")
 
@@ -522,24 +593,23 @@ def optimize_vertex_offsets(
     stage1_result: Stage1Result,
     loss_curve_path: Path | None = None,
 ) -> Stage2Result:
-    """M7 minimal: optimize per-vertex offset ΔV in canonical T-pose space
-    against the N keyframe SAM masks via differentiable silhouette
-    rendering + uniform Laplacian smoothing.
+    """Optimize per-vertex offset ΔV in canonical T-pose space against the
+    N keyframe SAM masks via differentiable silhouette rendering + uniform
+    Laplacian smoothing. M8 extends this with additional loss terms.
 
-    Knobs (config.py): LEARNING_RATE=1e-3, OPT_MAX_ITERS=200,
-    GRAD_CLIP_NORM=1.0, LOSS_WEIGHTS["silhouette"]=1.0,
-    LOSS_WEIGHTS["laplacian"]=100.0, FACES_PER_PIXEL=25,
-    RENDER_RESOLUTION=256.
+    Knobs in config.py: LEARNING_RATE, OPT_MAX_ITERS, GRAD_CLIP_NORM,
+    LOSS_WEIGHTS, FACES_PER_PIXEL, RENDER_RESOLUTION.
 
     No LR schedule, no early stop, no recovery branches. The grad-clip
     plus the conservative LR is the entire defense against pitfall #3
     (Stage 2 explosions).
 
-    If `loss_curve_path` is provided, writes a 3-line loss curve PNG to
-    that location (total + silhouette + 100·laplacian vs iter). The
-    silh/lap per-iter histories live only in this function's local scope
-    — they're NOT in Stage2Result by design, so the plot has to be
-    emitted here.
+    Per-iter raw (pre-weight) losses are collected into Stage2Result's
+    per_term_history dict so cross-run tuning comparisons can see which
+    term is moving. The total weighted loss is in loss_history.
+
+    If `loss_curve_path` is provided, writes a loss curve PNG to that
+    location.
     """
     device = settings.device
     N = stage1_result.n_frames
@@ -589,9 +659,15 @@ def optimize_vertex_offsets(
     )
 
     # --- Optimization loop ---
+    # loss_history holds the TOTAL (weighted) loss; per_term_lists holds
+    # the RAW (pre-weight) per-term losses, one list per active term.
+    # Added terms in later M8 steps just register a new key here — the
+    # save/load/round-trip path doesn't change.
     loss_history: list[float] = []
-    silh_history: list[float] = []   # raw silhouette IoU loss (pre-weighting)
-    lap_history: list[float] = []    # raw uniform-Laplacian loss (pre-weighting)
+    per_term_lists: dict[str, list[float]] = {
+        "silhouette": [],
+        "laplacian": [],
+    }
     LOG_EVERY = 10
 
     w_silh = float(LOSS_WEIGHTS["silhouette"])
@@ -612,8 +688,8 @@ def optimize_vertex_offsets(
         optimizer.step()
 
         loss_history.append(float(L.item()))
-        silh_history.append(float(L_silh.item()))
-        lap_history.append(float(L_lap.item()))
+        per_term_lists["silhouette"].append(float(L_silh.item()))
+        per_term_lists["laplacian"].append(float(L_lap.item()))
         if it % LOG_EVERY == 0 or it == OPT_MAX_ITERS - 1:
             logger.info(
                 "iter {:3d}: L={:.5f}  silh={:.5f}  lap={:.5f}  "
@@ -621,6 +697,10 @@ def optimize_vertex_offsets(
                 it, float(L.item()), float(L_silh.item()), float(L_lap.item()),
                 float(delta_v.detach().abs().max().item()),
             )
+
+    per_term_history: dict[str, np.ndarray] = {
+        name: np.array(lst, dtype=np.float32) for name, lst in per_term_lists.items()
+    }
 
     # --- Final IoU + bookkeeping ---
     with torch.no_grad():
@@ -644,15 +724,11 @@ def optimize_vertex_offsets(
     )
 
     # --- Loss curve (optional) ---
-    # Persisted only if caller provides a path. silh/lap histories are
-    # local-scope — Stage2Result.loss_history is just the total — so the
-    # plot must be emitted here. M8 will likely add more loss components,
-    # at which point this becomes the natural place to extend.
     if loss_curve_path is not None:
         iters = np.arange(OPT_MAX_ITERS)
         total_arr = np.array(loss_history, dtype=np.float32)
-        silh_arr = np.array(silh_history, dtype=np.float32)
-        lap_weighted_arr = w_lap * np.array(lap_history, dtype=np.float32)
+        silh_arr = per_term_history["silhouette"]
+        lap_weighted_arr = w_lap * per_term_history["laplacian"]
 
         fig, ax = plt.subplots(figsize=(8, 5))
         ax.plot(iters, total_arr, label="total", linewidth=2.0, color="black")
@@ -685,6 +761,7 @@ def optimize_vertex_offsets(
         loss_history=np.array(loss_history, dtype=np.float32),
         initial_iou_per_frame=initial_iou.astype(np.float32),
         final_iou_per_frame=final_iou.astype(np.float32),
+        per_term_history=per_term_history,
     )
 
 
