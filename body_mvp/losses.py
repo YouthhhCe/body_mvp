@@ -1,5 +1,5 @@
-"""Stage 2 loss terms: silhouette IoU (soft + hard), Laplacian smoothing,
-normal consistency."""
+"""Stage 2 loss terms: silhouette IoU (soft + hard), weighted silhouette IoU,
+Laplacian smoothing, normal consistency."""
 
 import torch
 from pytorch3d.loss import mesh_laplacian_smoothing, mesh_normal_consistency
@@ -22,6 +22,25 @@ def silhouette_iou_loss(
     pmax = torch.maximum(pred_alpha, target_mask)
     intersection = pmin.flatten(1).sum(dim=1)
     union = pmax.flatten(1).sum(dim=1) + eps
+    iou = intersection / union
+    return (1.0 - iou).mean()
+
+
+def weighted_silhouette_iou_loss(
+    pred_alpha: torch.Tensor,    # [N, H, W] in [0, 1] (SoftSilhouetteShader alpha)
+    target_mask: torch.Tensor,   # [N, H, W] float, {0, 1}
+    weight_map: torch.Tensor,    # [N, H, W] float, per-pixel weights ≥ 0
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Weighted soft-IoU loss. weight_map scales each pixel's contribution to
+    both intersection and union, reducing the gradient from regions where SAM
+    mask contamination is expected (hair, shoes, sleeves). Averaged over N
+    frames. Same min/max formulation as silhouette_iou_loss.
+    """
+    pmin = torch.minimum(pred_alpha, target_mask)
+    pmax = torch.maximum(pred_alpha, target_mask)
+    intersection = (pmin * weight_map).flatten(1).sum(dim=1)
+    union = (pmax * weight_map).flatten(1).sum(dim=1) + eps
     iou = intersection / union
     return (1.0 - iou).mean()
 

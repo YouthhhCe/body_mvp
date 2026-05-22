@@ -11,6 +11,7 @@ import smplx
 import smplx.lbs
 import torch
 from loguru import logger
+from pytorch3d.ops import interpolate_face_attributes
 from pytorch3d.structures import Meshes
 
 from body_mvp.config import (
@@ -26,7 +27,7 @@ from body_mvp.losses import (
     hard_iou_per_frame,
     laplacian_smoothing_loss,
     normal_consistency_loss,
-    silhouette_iou_loss,
+    weighted_silhouette_iou_loss,
 )
 from body_mvp.render import build_cameras, build_silhouette_renderer
 from body_mvp.stage1 import Stage1Result
@@ -415,6 +416,48 @@ def _build_region_weights(
     )
 
 
+def _render_weight_map(
+    meshes: Meshes,
+    silh_region_weights: torch.Tensor,  # [6890] float32, on device
+    renderer: torch.nn.Module,          # MeshRenderer exposing .rasterizer
+) -> torch.Tensor:
+    """Render per-vertex silhouette region weights to a [N, Ht, Wt] pixel map.
+
+    Uses the nearest visible face for each pixel (K=0 slice of the rasterizer
+    fragments). Background pixels (outside the mesh silhouette) receive 1.0
+    so the unweighted IoU formula applies outside the body.
+
+    Called once before the optimization loop — silh_region_weights are fixed
+    vertex labels that don't change during optimization.
+    """
+    device = silh_region_weights.device
+    N = len(meshes)
+
+    faces = meshes.faces_padded()[0]  # [F, 3] int64, on device
+
+    # Build face-vertex attribute tensor: [F, 3, 1] (not batched — interpolate
+    # handles the N dimension via pix_to_face).
+    face_attrs = silh_region_weights[faces].unsqueeze(-1)  # [F, 3, 1]
+
+    with torch.no_grad():
+        fragments = renderer.rasterizer(meshes)
+
+    # Take only K=0 (nearest face) to avoid blending across region boundaries.
+    pix_to_face_k0 = fragments.pix_to_face[..., :1]    # [N, H, W, 1]
+    bary_k0        = fragments.bary_coords[..., :1, :]  # [N, H, W, 1, 3]
+
+    # [N, H, W, 1, 1] → squeeze to [N, H, W]
+    pixel_weights = interpolate_face_attributes(pix_to_face_k0, bary_k0, face_attrs)
+    weight_map = pixel_weights[..., 0, 0]
+
+    # Background pixels (pix_to_face == -1) are set to 0 by interpolate;
+    # restore to 1.0 so background contributes equally on both sides of IoU.
+    background = fragments.pix_to_face[..., 0] < 0   # [N, H, W]
+    weight_map = weight_map.masked_fill(background, 1.0)
+
+    return weight_map.detach()
+
+
 def _pose_meshes(
     smpl_model: smplx.SMPL,
     beta: torch.Tensor,          # [10]      float, requires_grad=False
@@ -798,11 +841,16 @@ def optimize_vertex_offsets(
     delta_v = torch.nn.Parameter(torch.zeros(6890, 3, device=device, dtype=torch.float32))
     optimizer = torch.optim.Adam([delta_v], lr=LEARNING_RATE)
 
-    # --- Initial IoU (ΔV=0) ---
+    # --- Initial IoU (ΔV=0) + weight map ---
     with torch.no_grad():
         meshes0 = _pose_meshes(smpl_model, beta, theta, delta_v, cam_t, device)
         alpha0 = renderer(meshes0)[..., 3]
         initial_iou = hard_iou_per_frame((alpha0 > 0.5).float(), target_masks).cpu().numpy()
+        # Silhouette region weight map: computed once from the initial mesh.
+        # silh_region_weights are fixed vertex labels — they don't change as
+        # ΔV is optimized, and vertex positions shift only ~mm over 200 iters,
+        # not enough to move region boundaries meaningfully.
+        weight_map = _render_weight_map(meshes0, silh_region_weights, renderer)
     logger.info(
         "Initial mean IoU (ΔV=0): {:.4f} (min={:.4f}, max={:.4f})",
         float(initial_iou.mean()), float(initial_iou.min()), float(initial_iou.max()),
@@ -831,7 +879,7 @@ def optimize_vertex_offsets(
         meshes = _pose_meshes(smpl_model, beta, theta, delta_v, cam_t, device)
         alpha = renderer(meshes)[..., 3]                 # [N, Ht, Wt]
 
-        L_silh = silhouette_iou_loss(alpha, target_masks)
+        L_silh = weighted_silhouette_iou_loss(alpha, target_masks, weight_map)
         L_lap = laplacian_smoothing_loss(meshes)
         L_nc = normal_consistency_loss(meshes)
         L = w_silh * L_silh + w_lap * L_lap + w_nc * L_nc
