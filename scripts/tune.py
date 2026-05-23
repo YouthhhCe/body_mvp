@@ -56,6 +56,7 @@ def main(source_run: Path, height: float | None, weight: float | None) -> None:
 
     s2 = stage2.run(s1)
     stage2.save_silhouette_debug(s1, s2)
+    stage2.save_geometry_turntable(s1, s2)
 
     logger.info("Stage 2 result:")
     logger.info("  stage2_result.npz: {}", new_dir / "stage2_result.npz")

@@ -12,7 +12,16 @@ import smplx.lbs
 import torch
 from loguru import logger
 from pytorch3d.ops import interpolate_face_attributes
-from pytorch3d.renderer import MeshRasterizer
+from pytorch3d.renderer import (
+    DirectionalLights,
+    FoVPerspectiveCameras,
+    HardPhongShader,
+    MeshRasterizer,
+    MeshRenderer,
+    RasterizationSettings,
+    look_at_view_transform,
+)
+from pytorch3d.renderer.mesh.textures import TexturesVertex
 from pytorch3d.structures import Meshes
 
 from body_mvp.config import (
@@ -105,6 +114,14 @@ _COCO_TO_SMPL: tuple[tuple[int, int], ...] = (
 # Sapiens outputs +Z toward camera; PyTorch3D OpenCV camera has +Y down and
 # +Z into screen — flipping Y and Z aligns the two conventions.
 _SAPIENS_NORMAL_FLIP: tuple[int, int, int] = (1, -1, -1)
+
+
+# Turntable render constants — visualization only, no effect on optimization.
+_TURNTABLE_HW: tuple[int, int] = (384, 256)   # (Ht, Wt) per panel; portrait for standing body
+_TURNTABLE_N_VIEWS: int = 12                   # 30° intervals
+_TURNTABLE_DIST: float = 3.0                   # camera orbit radius in metres
+_TURNTABLE_ELEV: float = 15.0                  # camera elevation above horizontal (degrees)
+_TURNTABLE_FOV: float = 30.0                   # field of view (degrees)
 
 
 @dataclass
@@ -1023,6 +1040,120 @@ def sanity_check_normal_frame(
         float(np.degrees(np.arccos(np.clip(best_mean, -1, 1)))),
         best_flip,
     )
+
+
+def save_geometry_turntable(
+    stage1_result: Stage1Result,
+    stage2_result: Stage2Result,
+    n_views: int = _TURNTABLE_N_VIEWS,
+    out_dir: Path | None = None,
+) -> tuple[Path, Path]:
+    """Render 360° orbit strips of the canonical T-pose mesh: ΔV=0 vs final ΔV.
+
+    Visualization only — does not modify Stage2Result, ΔV, or any loss term.
+    Renders through the same MeshRasterizer as Stage 2 (HardPhongShader on top
+    for shaded output; rasterizer itself is identical). Callable from tune.py
+    so every D14 tuning round can inspect the surface without extra friction.
+
+    Returns (init_strip_path, final_strip_path) — both PNGs with n_views panels
+    each covering 360° / n_views degrees of azimuth, elevation 15° above
+    horizontal, camera distance 3 m, portrait panels (Ht > Wt).
+    """
+    device = settings.device
+    Ht, Wt = _TURNTABLE_HW
+
+    if out_dir is None:
+        out_dir = stage1_result.run_dir / "stage2"
+    out_dir.mkdir(exist_ok=True)
+
+    smpl_model = _load_smpl_model(device)
+    beta = torch.from_numpy(stage1_result.beta).to(device).float()
+
+    # Canonical vertices: v_template + β shapedirs + ΔV (ΔV=0 for init).
+    with torch.no_grad():
+        v_shape_only = smplx.lbs.blend_shapes(
+            beta.unsqueeze(0), smpl_model.shapedirs
+        ).squeeze(0)
+        v_init  = smpl_model.v_template + v_shape_only                               # [V, 3]
+        delta_v = torch.from_numpy(stage2_result.delta_v).to(device).float()
+        v_final = smpl_model.v_template + v_shape_only + delta_v                     # [V, 3]
+
+    faces_t = torch.from_numpy(smpl_model.faces.astype(np.int64)).to(device)        # [F, 3]
+
+    # Orbit cameras: azimuth 0°…330°, fixed elevation, looking at mesh centroid.
+    centroid = v_init.mean(dim=0).cpu()
+    azimuths = [i * 360.0 / n_views for i in range(n_views)]
+    R, T = look_at_view_transform(
+        dist=_TURNTABLE_DIST,
+        elev=_TURNTABLE_ELEV,
+        azim=azimuths,
+        at=centroid.unsqueeze(0),
+        up=((0.0, 1.0, 0.0),),   # canonical +Y up
+        device=device,
+    )
+    cameras = FoVPerspectiveCameras(R=R, T=T, fov=_TURNTABLE_FOV, device=device)
+
+    # Fixed-direction key light (world space, front+slight-top of canonical body).
+    # Same direction for all 12 views so each panel's shading gives depth cues
+    # relative to the orbit angle — lit side faces the canonical +Z front.
+    lights = DirectionalLights(
+        direction=torch.tensor([[0.0, -0.3, -1.0]], device=device),
+        ambient_color=torch.tensor([[0.4, 0.4, 0.4]], device=device),
+        diffuse_color=torch.tensor([[0.6, 0.6, 0.6]], device=device),
+        specular_color=torch.tensor([[0.0, 0.0, 0.0]], device=device),
+        device=device,
+    )
+
+    # Same MeshRasterizer class and settings as the normal-map path; HardPhongShader
+    # on top for shaded output (rasterizer itself is identical to build_normal_rasterizer).
+    raster_settings = RasterizationSettings(
+        image_size=(Ht, Wt),
+        blur_radius=0.0,
+        faces_per_pixel=1,
+    )
+    renderer = MeshRenderer(
+        rasterizer=MeshRasterizer(cameras=cameras, raster_settings=raster_settings),
+        shader=HardPhongShader(device=device, cameras=cameras, lights=lights),
+    )
+
+    def _render_strip(verts: torch.Tensor, label: str) -> np.ndarray:
+        """Batch-render n_views and assemble into a horizontal strip."""
+        verts_rgb = torch.ones(1, verts.shape[0], 3, device=device) * 0.75  # uniform gray
+        tex = TexturesVertex(verts_features=verts_rgb)
+        mesh = Meshes(verts=[verts], faces=[faces_t], textures=tex)
+        mesh_batch = mesh.extend(n_views)       # replicate for each camera
+        with torch.no_grad():
+            imgs = renderer(mesh_batch)         # [N, Ht, Wt, 4] RGBA float [0,1]
+
+        panels = []
+        for i in range(n_views):
+            img_rgb = imgs[i, ..., :3].clamp(0, 1).cpu().numpy()
+            panel = (img_rgb * 255).astype(np.uint8)
+            panel = cv2.cvtColor(panel, cv2.COLOR_RGB2BGR)
+            az = int(round(azimuths[i]))
+            cv2.putText(
+                panel, f"{az:03d}", (4, Ht - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1, cv2.LINE_AA,
+            )
+            panels.append(panel)
+
+        strip = cv2.hconcat(panels)             # [Ht, N*Wt, 3]
+        cv2.putText(
+            strip, label, (6, 18),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA,
+        )
+        return strip
+
+    logger.info("D13 turntable: rendering {} views at {}×{} each …", n_views, Wt, Ht)
+    strip_init  = _render_strip(v_init,  "ΔV=0 (initial)")
+    strip_final = _render_strip(v_final, f"ΔV final  max|ΔV|={float(np.abs(stage2_result.delta_v).max()):.4f}m")
+
+    init_path  = out_dir / "turntable_init.png"
+    final_path = out_dir / "turntable_final.png"
+    cv2.imwrite(str(init_path),  strip_init)
+    cv2.imwrite(str(final_path), strip_final)
+    logger.info("Wrote {} and {}", init_path, final_path)
+    return init_path, final_path
 
 
 def run(stage1_result: Stage1Result) -> Stage2Result:
