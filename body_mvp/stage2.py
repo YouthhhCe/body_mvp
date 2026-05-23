@@ -1193,9 +1193,6 @@ def run(stage1_result: Stage1Result) -> Stage2Result:
 
     Mirrors stage1.run's fail-loud persistence pattern.
     """
-    out_dir = stage1_result.run_dir / "stage2"
-    out_dir.mkdir(exist_ok=True)
-
     N = stage1_result.n_frames
     result = Stage2Result(
         run_id=stage1_result.run_id,

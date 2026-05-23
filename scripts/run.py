@@ -31,14 +31,14 @@ def main(video_path: Path, height: float, weight: float, gender: str) -> None:
     logger.info("Stage 2 result:")
     logger.info("  stage2_result.npz: {}", s2.run_dir / "stage2_result.npz")
     logger.info("  iters: {}, final_loss: {:.5f}", s2.n_iterations, s2.final_loss)
-    logger.info(
-        "  mean IoU init -> final: {:.4f} -> {:.4f} (Δ={:+.4f})",
-        float(s2.initial_iou_per_frame.mean()),
-        float(s2.final_iou_per_frame.mean()),
-        float(s2.final_iou_per_frame.mean() - s2.initial_iou_per_frame.mean()),
-    )
+    if s2.initial_iou_per_frame is not None:
+        logger.info(
+            "  mean IoU init -> final: {:.4f} -> {:.4f} (Δ={:+.4f})",
+            float(s2.initial_iou_per_frame.mean()),
+            float(s2.final_iou_per_frame.mean()),
+            float(s2.final_iou_per_frame.mean() - s2.initial_iou_per_frame.mean()),
+        )
     logger.info("  max|ΔV|: {:.5f}", float(np.abs(s2.delta_v).max()))
-    logger.info("  overlays + loss_curve in: {}", s2.run_dir / "stage2")
 
 
 if __name__ == "__main__":
