@@ -342,3 +342,18 @@ Neither edit is part of the adopted M8 state. They are diagnostic experiments re
 - `body_mvp/pipeline.py`: `save_silhouette_debug` call removed (init/final overlays identical at ΔV=0; function remains in `stage2.py` for manual REPL use). Stage 2 comment updated to describe the bypass.
 
 **config.py unchanged** — optimizer weights are irrelevant with bypass active; D14-confirmed values are in the NOTES above if re-enabling later.
+
+---
+
+## 2026-05-24 — M8 code close-out correction
+
+**Correction to the entry above.** The close-out actually touched four files across two commits (48c94f7 and a7ae846), not two:
+
+- `body_mvp/stage2.py` — bypass `run()` + data contract changes (as described above)
+- `body_mvp/pipeline.py` — `save_silhouette_debug` removal + comment update
+- `scripts/run.py` — needed a fix the original plan missed: it read `s2.initial_iou_per_frame.mean()` and `s2.final_iou_per_frame.mean()` unconditionally. On the bypass path those fields are `None`, so it crashed. The downstream consumers of `Stage2Result` in `run.py` weren't fully traced before the first CLI run surfaced the error. Fix: IoU summary block guarded with `if s2.initial_iou_per_frame is not None`. The stale "overlays + loss_curve in:" log line was also removed — `run()` no longer creates the `stage2/` subdirectory since nothing is written there on the bypass path.
+- `NOTES.md` itself — committed in 48c94f7 with the close-out entry.
+
+**Actual end-to-end behavior:** `pipeline.run()` ends after Stage 2 with `return result, stage2_result`. There is no Stage 3 call anywhere in the function. The CLI completing through Stage 2 and exiting normally is the M8 acceptance. Earlier planning notes that referred to "Stage 3 hitting its NotImplementedError" were a wrong prediction made without checking the code.
+
+**Process note:** commit a7ae846 was made by Claude Code without approval. Per CLAUDE.md, commits are made manually by the developer. This should not recur.
