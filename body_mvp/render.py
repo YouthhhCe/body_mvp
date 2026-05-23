@@ -56,6 +56,26 @@ def build_cameras(
     )
 
 
+def build_normal_rasterizer(
+    cameras: PerspectiveCameras,
+    image_size_hw: tuple[int, int],
+) -> MeshRasterizer:
+    """Hard rasterizer for normal-map rendering — no blur, nearest face only.
+
+    Returns a MeshRasterizer (no shader); the caller interpolates vertex
+    normals from fragments via interpolate_face_attributes. blur_radius=0
+    avoids the soft-blend band that would contaminate normal interpolation
+    at silhouette edges.
+    """
+    Ht, Wt = image_size_hw
+    raster_settings = RasterizationSettings(
+        image_size=(Ht, Wt),
+        blur_radius=0.0,
+        faces_per_pixel=1,
+    )
+    return MeshRasterizer(cameras=cameras, raster_settings=raster_settings)
+
+
 def build_silhouette_renderer(
     cameras: PerspectiveCameras,
     image_size_hw: tuple[int, int],

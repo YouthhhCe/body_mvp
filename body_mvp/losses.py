@@ -1,6 +1,6 @@
 """Stage 2 loss terms: silhouette IoU (soft + hard), weighted silhouette IoU,
 height match, keypoint reprojection, bilateral symmetry, Laplacian smoothing,
-normal consistency."""
+normal consistency, normal-map alignment."""
 
 import torch
 from pytorch3d.loss import mesh_laplacian_smoothing, mesh_normal_consistency
@@ -131,6 +131,55 @@ def symmetry_loss(
     err2 = ((delta_v - dv_reflected) ** 2).sum(dim=1)   # [6890]
     w_sum = sym_region_weights.sum().clamp(min=1.0)
     return (sym_region_weights * err2).sum() / w_sum
+
+
+def normal_map_loss(
+    rendered_normals: torch.Tensor,   # [N, H, W, 3] unit normals, PyTorch3D camera space
+    sapiens_normals: torch.Tensor,    # [N, H, W, 3] unit normals, same convention (pre-flipped)
+    sapiens_fg: torch.Tensor,         # [N, H, W] bool
+    rendered_fg: torch.Tensor,        # [N, H, W] bool
+    grazing_threshold: float = 0.5,   # |n_z| gate; D14 tuning target
+    edge_erosion_px: int = 4,         # silhouette-edge erosion; D14 tuning target
+) -> torch.Tensor:
+    """Mean cosine-distance loss gated to face-on interior pixels.
+
+    Two masks, both detached so ΔV gradient flows through normal values only,
+    not through the mask selection boundaries:
+
+    grazing_gate  : |rendered_n_z| > grazing_threshold — excludes near-perpendicular
+                    surfaces where SMPL vertex-normal interpolation is unreliable
+                    at coarse mesh resolution. Recomputed each iteration as ΔV
+                    deforms the mesh (unlike D8's weight_map which is fixed).
+
+    interior_gate : rendered_fg eroded by edge_erosion_px pixels (max_pool dilation
+                    of background) — excludes silhouette-edge pixels where
+                    rasterization boundary artifacts spike the error.
+
+    D12 diagnosis: face-on interior mean cosine error 0.060 vs edge/grazing
+    0.41–0.53 (7× gap). Both thresholds are D14 tuning targets.
+    """
+    # Grazing gate — detach so the threshold boundary carries no gradient.
+    # rendered_normals[..., 2] has grad_fn from delta_v; .detach() cuts it
+    # for the mask only; the dot product below still receives the full gradient.
+    grazing_gate = (rendered_normals[..., 2].abs() > grazing_threshold).detach()  # [N, H, W]
+
+    # Edge erosion gate via dilation of background (max_pool on inverted fg).
+    # Pixels within edge_erosion_px of the silhouette edge become background.
+    if edge_erosion_px > 0:
+        k = edge_erosion_px
+        fg_4d = rendered_fg.float().unsqueeze(1)               # [N, 1, H, W]
+        dilated_bg = torch.nn.functional.max_pool2d(
+            1.0 - fg_4d, kernel_size=2 * k + 1, stride=1, padding=k,
+        )
+        interior_gate = ((1.0 - dilated_bg).squeeze(1) > 0.5).detach()  # [N, H, W] bool
+    else:
+        interior_gate = rendered_fg
+
+    valid = sapiens_fg & interior_gate & grazing_gate          # [N, H, W] bool
+    n_valid = valid.float().sum().clamp(min=1.0)
+    dot = (rendered_normals * sapiens_normals).sum(dim=-1)    # [N, H, W]
+    cosine_dist = 1.0 - dot
+    return (cosine_dist * valid.float()).sum() / n_valid
 
 
 def laplacian_smoothing_loss(meshes: Meshes) -> torch.Tensor:

@@ -12,6 +12,7 @@ import smplx.lbs
 import torch
 from loguru import logger
 from pytorch3d.ops import interpolate_face_attributes
+from pytorch3d.renderer import MeshRasterizer
 from pytorch3d.structures import Meshes
 
 from body_mvp.config import (
@@ -20,6 +21,8 @@ from body_mvp.config import (
     HEIGHT_TOLERANCE_M,
     LEARNING_RATE,
     LOSS_WEIGHTS,
+    NORMAL_EDGE_EROSION_PX,
+    NORMAL_GRAZING_THRESHOLD,
     OPT_MAX_ITERS,
     RENDER_RESOLUTION,
     settings,
@@ -30,10 +33,11 @@ from body_mvp.losses import (
     keypoint_reprojection_loss,
     laplacian_smoothing_loss,
     normal_consistency_loss,
+    normal_map_loss,
     symmetry_loss,
     weighted_silhouette_iou_loss,
 )
-from body_mvp.render import build_cameras, build_silhouette_renderer
+from body_mvp.render import build_cameras, build_normal_rasterizer, build_silhouette_renderer
 from body_mvp.stage1 import Stage1Result
 
 # hmr2's training crop size. focal_length_per_frame in Stage1Result is in
@@ -93,6 +97,14 @@ _COCO_TO_SMPL: tuple[tuple[int, int], ...] = (
     (15, 7),   # L_ankle
     (16, 8),   # R_ankle
 )
+
+
+# Sapiens normal convention → PyTorch3D camera convention.
+# Verified empirically via 8-flip sweep across frames 0, 3, 6, 9:
+# mean cosine similarity peaks at (1, -1, -1) with values 0.77–0.85.
+# Sapiens outputs +Z toward camera; PyTorch3D OpenCV camera has +Y down and
+# +Z into screen — flipping Y and Z aligns the two conventions.
+_SAPIENS_NORMAL_FLIP: tuple[int, int, int] = (1, -1, -1)
 
 
 @dataclass
@@ -480,6 +492,87 @@ def _render_weight_map(
     return weight_map.detach()
 
 
+def _load_sapiens_normals(
+    stage1_result: "Stage1Result",
+    render_hw: tuple[int, int],
+    device: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Load Sapiens normal maps, resize to render resolution, apply sign flip.
+
+    Returns
+    -------
+    normals : [N, Ht, Wt, 3] float32 on device — unit normals in PyTorch3D
+        camera space (flip applied, background zeroed, re-normalized).
+    fg : [N, Ht, Wt] bool on device — True where Sapiens has a valid normal.
+    """
+    Ht, Wt = render_hw
+    N = stage1_result.n_frames
+    flip = np.array(_SAPIENS_NORMAL_FLIP, dtype=np.float32)  # [3]
+
+    normals_stack = np.zeros((N, Ht, Wt, 3), dtype=np.float32)
+    fg_stack = np.zeros((N, Ht, Wt), dtype=bool)
+
+    for i, npath in enumerate(stage1_result.normal_paths):
+        data = np.load(str(npath), allow_pickle=False)
+        n_hw3 = data["normals"]             # [H, W, 3] float32, bg=0
+        fg_hw = data["foreground"] > 0      # [H, W] bool
+
+        n_r = cv2.resize(n_hw3, (Wt, Ht), interpolation=cv2.INTER_LINEAR)
+        fg_r = cv2.resize(fg_hw.astype(np.uint8), (Wt, Ht), interpolation=cv2.INTER_NEAREST) > 0
+
+        n_r = n_r * flip                    # apply convention flip
+        norms = np.linalg.norm(n_r, axis=-1, keepdims=True)
+        norms = np.where(fg_r[..., None], norms, 1.0)
+        n_r = n_r / norms.clip(min=1e-6)
+        n_r[~fg_r] = 0.0
+
+        normals_stack[i] = n_r
+        fg_stack[i] = fg_r
+
+    return (
+        torch.from_numpy(normals_stack).to(device),
+        torch.from_numpy(fg_stack).to(device),
+    )
+
+
+def _render_normal_map(
+    meshes: Meshes,
+    rasterizer: MeshRasterizer,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Render per-pixel vertex normals for all N frames.
+
+    Uses PACKED face attributes to handle the batched Meshes correctly —
+    pix_to_face returns global (packed) indices across the batch, so
+    face_attrs must be indexed as [N*F, 3, 3], not [F, 3, 3].
+
+    Gradient flows: delta_v → vertex positions → verts_normals_packed()
+    (cross-product of edge vectors) → interpolate_face_attributes → normals.
+
+    Returns
+    -------
+    normals : [N, H, W, 3] float32 — unit normals in camera space.
+    fg : [N, H, W] bool — True where the rasterizer found a face.
+    """
+    fragments = rasterizer(meshes)
+
+    verts_normals = meshes.verts_normals_packed()   # [N*V, 3]
+    faces = meshes.faces_packed()                   # [N*F, 3]
+    face_attrs = verts_normals[faces]               # [N*F, 3, 3]
+
+    pix_to_face_k0 = fragments.pix_to_face[..., :1]    # [N, H, W, 1]
+    bary_k0 = fragments.bary_coords[..., :1, :]          # [N, H, W, 1, 3]
+
+    # [N, H, W, 1, 3] → squeeze to [N, H, W, 3]
+    pixel_normals = interpolate_face_attributes(pix_to_face_k0, bary_k0, face_attrs)
+    normals = pixel_normals[..., 0, :]              # [N, H, W, 3]
+
+    norms = normals.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    normals = normals / norms
+
+    fg = fragments.pix_to_face[..., 0] >= 0        # [N, H, W] bool
+    return normals, fg
+
+
 def _pose_meshes(
     smpl_model: smplx.SMPL,
     beta: torch.Tensor,          # [10]      float, requires_grad=False
@@ -762,6 +855,104 @@ def sanity_render_all_frames(stage1_result: Stage1Result) -> list[Path]:
     return out_paths
 
 
+def sanity_check_normal_frame(
+    stage1_result: Stage1Result,
+    frame_indices: tuple[int, ...] = (0, 3, 6, 9),
+) -> None:
+    """Dev-only: run all 8 sign-flip candidates for Sapiens→PyTorch3D normal
+    convention, log mean cosine similarity for each.
+
+    Determines which flip to use for _SAPIENS_NORMAL_FLIP. Run this whenever
+    the Sapiens model, render pipeline, or camera convention changes. Results
+    are logged at INFO level; the caller picks the winner from the output.
+
+    The computation is score = mean cosine similarity between the flipped
+    Sapiens unit normals and the PyTorch3D-rendered SMPL vertex normals, in
+    the intersection of the two foreground masks (ΔV=0 initial mesh).
+    """
+    import itertools
+    device = settings.device
+
+    W_orig, H_orig = stage1_result.image_size_wh
+    Ht, Wt, _ = _compute_render_resolution(W_orig, H_orig)
+
+    smpl_model = _load_smpl_model(device)
+    beta  = torch.from_numpy(stage1_result.beta).to(device).float()
+    theta = torch.from_numpy(stage1_result.theta_per_frame).to(device).float()
+    cam_t = torch.from_numpy(stage1_result.pred_cam_t_per_frame).to(device).float()
+    fl_orig = torch.from_numpy(stage1_result.focal_length_per_frame).to(device).float()
+    fl_render = fl_orig / _HMR2_CROP_SIZE * max(Wt, Ht)
+
+    cameras = build_cameras(fl_render, (Ht, Wt), device)
+    normal_rasterizer = build_normal_rasterizer(cameras, (Ht, Wt))
+
+    delta_v = torch.zeros(6890, 3, device=device)
+    with torch.no_grad():
+        meshes, _ = _pose_meshes(smpl_model, beta, theta, delta_v, cam_t, device)
+        rendered_normals, rendered_fg = _render_normal_map(meshes, normal_rasterizer)
+
+    fi_list = [fi for fi in frame_indices if fi < stage1_result.n_frames]
+    logger.info(
+        "sanity_check_normal_frame: render={}x{}, frames={}",
+        Wt, Ht, fi_list,
+    )
+    logger.info("{:>20}  {}  {:>6}", "flip", "  ".join(f"fr{fi:02d}" for fi in fi_list), "mean")
+    logger.info("-" * (24 + 8 * len(fi_list)))
+
+    best_flip: tuple[int, int, int] | None = None
+    best_mean = -2.0
+
+    with torch.no_grad():
+        for sx, sy, sz in itertools.product([-1, 1], repeat=3):
+            flip = np.array([sx, sy, sz], dtype=np.float32)
+            scores: list[float] = []
+            for fi in fi_list:
+                data = np.load(str(stage1_result.normal_paths[fi]), allow_pickle=False)
+                n_hw3 = data["normals"]
+                fg_hw = data["foreground"] > 0
+
+                n_r = cv2.resize(n_hw3, (Wt, Ht), interpolation=cv2.INTER_LINEAR)
+                fg_r = cv2.resize(
+                    fg_hw.astype(np.uint8), (Wt, Ht), interpolation=cv2.INTER_NEAREST
+                ) > 0
+
+                n_r = n_r * flip
+                norms = np.linalg.norm(n_r, axis=-1, keepdims=True)
+                norms = np.where(fg_r[..., None], norms, 1.0)
+                n_r = n_r / norms.clip(min=1e-6)
+                n_r[~fg_r] = 0.0
+
+                sap_n = torch.from_numpy(n_r).to(device).float()
+                sap_fg = torch.from_numpy(fg_r).to(device)
+                valid = sap_fg & rendered_fg[fi]
+                n_valid = valid.float().sum().item()
+                if n_valid < 100:
+                    scores.append(float("nan"))
+                    continue
+                dot = (rendered_normals[fi] * sap_n).sum(dim=-1)
+                scores.append(float(dot[valid].mean().item()))
+
+            mean_score = float(np.nanmean(scores)) if scores else float("nan")
+            row = f"({sx:+d},{sy:+d},{sz:+d})"
+            logger.info(
+                "{:>20}  {}  {:>6.4f}",
+                row,
+                "  ".join(f"{s:.4f}" for s in scores),
+                mean_score,
+            )
+            if mean_score > best_mean:
+                best_mean = mean_score
+                best_flip = (sx, sy, sz)
+
+    logger.info(
+        "Winner: {} (mean cosine={:.4f}, angle≈{:.1f}°). "
+        "Set _SAPIENS_NORMAL_FLIP = {}.",
+        best_flip, best_mean,
+        float(np.degrees(np.arccos(np.clip(best_mean, -1, 1)))),
+        best_flip,
+    )
+
+
 def run(stage1_result: Stage1Result) -> Stage2Result:
     """M7 Stage 2 entry point. Optimizes ΔV against Stage 1's masks,
     persists Stage2Result + loss_curve.png + per-frame overlays, runs the
@@ -836,14 +1027,16 @@ def optimize_vertex_offsets(
     Ht, Wt, _scale = _compute_render_resolution(W_orig, H_orig)
     logger.info(
         "Stage 2 setup: N={}, render={}x{}, lr={}, iters={}, "
-        "w_silh={}, w_lap={}, w_nc={}, w_height={}, w_kp={}, w_sym={}, grad_clip={}, "
-        "target_height={:.2f}m±{:.2f}m",
+        "w_silh={}, w_lap={}, w_nc={}, w_normal={}, w_height={}, w_kp={}, w_sym={}, "
+        "grad_clip={}, target_height={:.2f}m±{:.2f}m, "
+        "normal_grazing_thresh={}, normal_edge_erosion={}px",
         N, Wt, Ht, LEARNING_RATE, OPT_MAX_ITERS,
         LOSS_WEIGHTS["silhouette"], LOSS_WEIGHTS["laplacian"],
-        LOSS_WEIGHTS["normal_consistency"], LOSS_WEIGHTS["height"],
-        LOSS_WEIGHTS["keypoint"], LOSS_WEIGHTS["symmetry"],
+        LOSS_WEIGHTS["normal_consistency"], LOSS_WEIGHTS["normal"],
+        LOSS_WEIGHTS["height"], LOSS_WEIGHTS["keypoint"], LOSS_WEIGHTS["symmetry"],
         GRAD_CLIP_NORM,
         stage1_result.height_cm / 100.0, HEIGHT_TOLERANCE_M,
+        NORMAL_GRAZING_THRESHOLD, NORMAL_EDGE_EROSION_PX,
     )
 
     smpl_model = _load_smpl_model(device)
@@ -879,7 +1072,13 @@ def optimize_vertex_offsets(
     fl_render = fl_orig / _HMR2_CROP_SIZE * max(Wt, Ht)
     cameras = build_cameras(fl_render, (Ht, Wt), device)
     renderer = build_silhouette_renderer(cameras, (Ht, Wt), FACES_PER_PIXEL)
+    normal_rasterizer = build_normal_rasterizer(cameras, (Ht, Wt))
     target_masks = _load_target_masks(stage1_result, (Ht, Wt), device)  # [N, Ht, Wt]
+    sapiens_normals, sapiens_fg = _load_sapiens_normals(stage1_result, (Ht, Wt), device)
+    logger.info(
+        "Sapiens normals loaded: {} frames, foreground coverage {:.3f}",
+        N, float(sapiens_fg.float().mean().item()),
+    )
 
     # ΔV — the only optimization variable.
     delta_v = torch.nn.Parameter(torch.zeros(6890, 3, device=device, dtype=torch.float32))
@@ -910,6 +1109,7 @@ def optimize_vertex_offsets(
         "silhouette": [],
         "laplacian": [],
         "normal_consistency": [],
+        "normal": [],
         "height": [],
         "keypoint": [],
         "symmetry": [],
@@ -919,6 +1119,7 @@ def optimize_vertex_offsets(
     w_silh   = float(LOSS_WEIGHTS["silhouette"])
     w_lap    = float(LOSS_WEIGHTS["laplacian"])
     w_nc     = float(LOSS_WEIGHTS["normal_consistency"])
+    w_normal = float(LOSS_WEIGHTS["normal"])
     w_height = float(LOSS_WEIGHTS["height"])
     w_kp     = float(LOSS_WEIGHTS["keypoint"])
     w_sym    = float(LOSS_WEIGHTS["symmetry"])
@@ -930,16 +1131,22 @@ def optimize_vertex_offsets(
         meshes, joints_world = _pose_meshes(smpl_model, beta, theta, delta_v, cam_t, device)
         alpha = renderer(meshes)[..., 3]                 # [N, Ht, Wt]
 
+        rendered_normals, rendered_fg = _render_normal_map(meshes, normal_rasterizer)
         L_silh   = weighted_silhouette_iou_loss(alpha, target_masks, weight_map)
         L_lap    = laplacian_smoothing_loss(meshes)
         L_nc     = normal_consistency_loss(meshes)
+        L_normal = normal_map_loss(
+            rendered_normals, sapiens_normals, sapiens_fg, rendered_fg,
+            grazing_threshold=NORMAL_GRAZING_THRESHOLD,
+            edge_erosion_px=NORMAL_EDGE_EROSION_PX,
+        )
         L_height = height_loss(v_canonical, target_height_m, HEIGHT_TOLERANCE_M)
         L_kp     = keypoint_reprojection_loss(
             joints_world, kp_xy, kp_scores, _COCO_TO_SMPL, fl_render, (Ht, Wt),
         )
         L_sym    = symmetry_loss(delta_v, sym_region_weights, right_to_left)
         L = (w_silh * L_silh + w_lap * L_lap + w_nc * L_nc
-             + w_height * L_height + w_kp * L_kp + w_sym * L_sym)
+             + w_normal * L_normal + w_height * L_height + w_kp * L_kp + w_sym * L_sym)
 
         L.backward()
         torch.nn.utils.clip_grad_norm_([delta_v], max_norm=GRAD_CLIP_NORM)
@@ -949,16 +1156,17 @@ def optimize_vertex_offsets(
         per_term_lists["silhouette"].append(float(L_silh.item()))
         per_term_lists["laplacian"].append(float(L_lap.item()))
         per_term_lists["normal_consistency"].append(float(L_nc.item()))
+        per_term_lists["normal"].append(float(L_normal.item()))
         per_term_lists["height"].append(float(L_height.item()))
         per_term_lists["keypoint"].append(float(L_kp.item()))
         per_term_lists["symmetry"].append(float(L_sym.item()))
         if it % LOG_EVERY == 0 or it == OPT_MAX_ITERS - 1:
             logger.info(
                 "iter {:3d}: L={:.5f}  silh={:.5f}  lap={:.5f}  nc={:.5f}  "
-                "height={:.5f}  kp={:.2f}  sym={:.5f}  |ΔV|_max={:.5f}",
+                "normal={:.5f}  height={:.5f}  kp={:.2f}  sym={:.5f}  |ΔV|_max={:.5f}",
                 it, float(L.item()), float(L_silh.item()), float(L_lap.item()),
-                float(L_nc.item()), float(L_height.item()), float(L_kp.item()),
-                float(L_sym.item()),
+                float(L_nc.item()), float(L_normal.item()), float(L_height.item()),
+                float(L_kp.item()), float(L_sym.item()),
                 float(delta_v.detach().abs().max().item()),
             )
 
@@ -992,11 +1200,12 @@ def optimize_vertex_offsets(
         iters = np.arange(OPT_MAX_ITERS)
         total_arr = np.array(loss_history, dtype=np.float32)
         silh_arr = per_term_history["silhouette"]
-        lap_weighted_arr = w_lap * per_term_history["laplacian"]
-        nc_weighted_arr = w_nc * per_term_history["normal_consistency"]
+        lap_weighted_arr    = w_lap    * per_term_history["laplacian"]
+        nc_weighted_arr     = w_nc     * per_term_history["normal_consistency"]
+        normal_weighted_arr = w_normal * per_term_history["normal"]
         height_weighted_arr = w_height * per_term_history["height"]
-        kp_weighted_arr  = w_kp * per_term_history["keypoint"]
-        sym_weighted_arr = w_sym * per_term_history["symmetry"]
+        kp_weighted_arr     = w_kp     * per_term_history["keypoint"]
+        sym_weighted_arr    = w_sym    * per_term_history["symmetry"]
 
         fig, ax = plt.subplots(figsize=(8, 5))
         ax.plot(iters, total_arr, label="total", linewidth=2.0, color="black")
@@ -1008,6 +1217,10 @@ def optimize_vertex_offsets(
         ax.plot(
             iters, nc_weighted_arr,
             label=f"normal_consistency (w={w_nc})", linewidth=1.2, color="tab:green",
+        )
+        ax.plot(
+            iters, normal_weighted_arr,
+            label=f"normal_map (w={w_normal})", linewidth=1.2, color="tab:cyan",
         )
         ax.plot(
             iters, height_weighted_arr,

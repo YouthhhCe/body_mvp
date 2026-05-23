@@ -33,6 +33,13 @@ GRAD_CLIP_NORM: float = 1.0       # M7 defense vs. pitfall #3 explosions
 RENDER_RESOLUTION: int = 512      # long side; bumped 256->512 for M8 (normal/keypoint detail)
 HEIGHT_TOLERANCE_M: float = 0.05  # ±5 cm dead-band for height loss; no penalty inside band
 FACES_PER_PIXEL: int = 25         # SoftSilhouetteShader fragment depth
+# Normal-map loss gates — D14 tuning targets.
+# Diagnosed D12: face-on interior error 0.06 vs edge/grazing 0.41-0.53 (7× gap).
+# Grazing surfaces and silhouette-edge pixels are excluded because SMPL vertex-normal
+# interpolation is unreliable there at 288×512 resolution; 12-frame union still
+# covers 360° in the face-on band. See NOTES for D12 spatial analysis.
+NORMAL_GRAZING_THRESHOLD: float = 0.5   # gate: |rendered_n_z| > this; keeps front hemisphere
+NORMAL_EDGE_EROSION_PX: int = 4         # erode rendered silhouette by this many pixels
 LOSS_WEIGHTS: dict[str, float] = {
     "silhouette": 1.0,
     "normal": 0.5,
