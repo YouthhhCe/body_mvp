@@ -492,6 +492,20 @@ def _render_weight_map(
     return weight_map.detach()
 
 
+def _median_tz_cam_t(cam_t_raw: torch.Tensor) -> torch.Tensor:
+    """Replace per-frame tz with the median across all frames.
+
+    Fixed-camera physical prior: pred_cam_t_per_frame[:, 2] varies because
+    hmr2 recovers depth from apparent body scale per frame — a noisy estimate
+    for a truly fixed camera (diagnosed: 3.1 m range, 6.3% on 001631). The
+    median cancels per-frame noise without introducing a learnable parameter.
+    tx/ty (columns 0/1) are clean and left per-frame.
+    """
+    cam_t = cam_t_raw.clone()
+    cam_t[:, 2] = cam_t_raw[:, 2].median()
+    return cam_t
+
+
 def _load_sapiens_normals(
     stage1_result: "Stage1Result",
     render_hw: tuple[int, int],
@@ -1049,7 +1063,14 @@ def optimize_vertex_offsets(
     # future reader doesn't have to ask.
     beta = torch.from_numpy(stage1_result.beta).to(device).float().requires_grad_(False)
     theta = torch.from_numpy(stage1_result.theta_per_frame).to(device).float().requires_grad_(False)
-    cam_t = torch.from_numpy(stage1_result.pred_cam_t_per_frame).to(device).float().requires_grad_(False)
+    cam_t_raw = torch.from_numpy(stage1_result.pred_cam_t_per_frame).to(device).float()
+    cam_t = _median_tz_cam_t(cam_t_raw).requires_grad_(False)
+    tz_vals = cam_t_raw[:, 2]
+    logger.info(
+        "FIX2 median-tz: original tz range [{:.3f}, {:.3f}] m → median {:.3f} m "
+        "(fixed-camera physical prior; 6.3% jitter cancelled)",
+        float(tz_vals.min()), float(tz_vals.max()), float(cam_t[0, 2]),
+    )
     fl_orig = torch.from_numpy(stage1_result.focal_length_per_frame).to(device).float()
 
     # v_shape_only is beta-dependent but beta is frozen; compute once outside loop.
@@ -1296,7 +1317,9 @@ def save_silhouette_debug(
     smpl_model = _load_smpl_model(device)
     beta = torch.from_numpy(stage1_result.beta).to(device).float()
     theta = torch.from_numpy(stage1_result.theta_per_frame).to(device).float()
-    cam_t = torch.from_numpy(stage1_result.pred_cam_t_per_frame).to(device).float()
+    cam_t = _median_tz_cam_t(
+        torch.from_numpy(stage1_result.pred_cam_t_per_frame).to(device).float()
+    )
     fl_orig = torch.from_numpy(stage1_result.focal_length_per_frame).to(device).float()
     fl_render = fl_orig / _HMR2_CROP_SIZE * max(Wt, Ht)
 
