@@ -144,3 +144,190 @@ Running log of decisions, parameter experiments, and open questions. See CLAUDE.
 - Whether uniform Laplacian is enough regularization once M8's stronger silhouette pull lands, or whether `mesh_normal_consistency` is needed.
 
 **Next:** M8 — Stage 2 full loss + tuning. Enable normal-map agreement, keypoint reprojection, height match, part-aware terms; tune weights on the test video. Longest milestone.
+
+---
+
+## 2026-05-23 — M8 Stage 2 full loss + tuning (D6–D13, through pre-D14)
+
+**Done:** All M8 loss terms implemented and integrated into `optimize_vertex_offsets`. Geometry turntable visualisation added. Two camera-level fixes (FIX1/FIX2) diagnosed and committed after turntable review. Work in progress: D14 weight tuning (not started yet).
+
+### D-steps completed
+
+**D6 — normal consistency loss term** (`mesh_normal_consistency`). Wired into the optimization loop via `normal_consistency_loss` in `losses.py`; initial weight 0.1.
+
+**D7 — region weight infrastructure** (`_build_region_weights` in `stage2.py`). Builds three arrays: `silh_region_weights [6890]` (per-vertex part weights for weighted silhouette IoU, D8 predecessor), `sym_region_weights [6890]` (weights for bilateral symmetry loss), `right_to_left [6890]` (SMPL mirror-vertex index map via nearest-neighbour in canonical space with x-flip). Belly vertices zeroed in sym weights; non-involution vertices (where the nearest-neighbour map isn't a true involution) zeroed out after a self-consistency gate.
+
+**D8 — part-aware silhouette weighting** (`render_weight_map` + `weighted_silhouette_iou_loss`). `render_weight_map` rasterizes the per-vertex silhouette weights to a [H,W] map using `pix_to_face` packed global indices (face_attrs must be [N×F, 3, 3], not [F, 3, 3] — this was a PyTorch3D gotcha). Weighted soft-IoU then scales intersection and union per-pixel.
+
+**D9 — height match loss** (`height_loss` in `losses.py`). Squared-hinge loss on SMPL Y-span vs target height; ±5 cm tolerance band. Weight 10.0 (initial).
+
+**D10 — keypoint reprojection loss** (`keypoint_reprojection_loss` in `losses.py`). COCO-17 → SMPL-24 fixed mapping (12 pairs: shoulders/elbows/wrists/hips/knees/ankles; face kps and nose excluded — SMPL joint 15 is neck top, no nose analogue). Score gate >0.3; projection via `fl*X/Z + cx`. Weight 1e-3 placeholder (pixel² vs IoU scale).
+
+**D11 — bilateral symmetry loss** (`symmetry_loss` in `losses.py`). Penalises |ΔV[i] − mirror(ΔV[j])|² where j is the mirror partner (right_to_left map from D7). Flips x-only (canonical +x = subject's left). Normalised by total weight sum. Weight 0.01 (initial).
+
+**D12 — Sapiens normal-map loss** (`normal_map_loss` in `losses.py`). Three-session diagnostic to get the sign convention and gate right — details below. Final: mean cosine-distance loss gated to interior face-on pixels. Two gates: (1) grazing gate |rendered_n_z| > 0.5, (2) edge erosion gate via 4-px max_pool dilation of background. Weight 0.5 (initial).
+
+**FIX2 — median-tz cam_t correction** (`_median_tz_cam_t` in `stage2.py`). Physical prior: video is fixed camera, spinning subject — per-frame tz should be constant. hmr2's weak-perspective estimation introduced 3.1 m range (6.3%) across 12 frames on run 001631 (tz min=49.2, max=52.3, median=50.576 m). Helper clones cam_t, replaces `[:, 2]` with `median()`. Applied in both `optimize_vertex_offsets` and `save_silhouette_debug` (debug overlays must use same corrected cam_t as optimizer — not applying it there was an initial error, corrected before coding).
+
+**FIX1 — orientation-balanced silhouette weighting** (`_frame_orientation_weights` in `stage2.py`). Run 001631 has 4 back-view frames (0, 1, 10, 11) spanning only 8.3° vs 360° total — each was receiving 4× the silhouette gradient of a front frame. Fix: bandwidth = π/N = 15° for N=12; count[i] = frames whose azimuth is within 15° of frame i; weight[i] = 1/count[i]. Back frames each counted 4 neighbours → weight 0.25; sum of 4 back-frame weights = 1.0, cancelling oversampling exactly. Azimuths derived from hmr2 global_orient axis-angle by extracting the forward-vector Y-component and Z-component and taking arctan2. In the optimizer loop: `L_silh = (per_frame_silh * frame_orient_weights).sum() / frame_orient_weights.sum()`.
+
+**D13 — geometry turntable** (`save_geometry_turntable` in `stage2.py`). 12 fixed-elevation views equally spaced 0–330°; rendered via PyTorch3D `HardPhongShader` on a Meshes with a point light; saved as a montage strip to `<run_dir>/debug/turntable.png`. Used as the primary diagnostic for roughness.
+
+### D12 four-round normal-map loss diagnosis
+
+This took four distinct rounds before converging on the correct sign convention and gating.
+
+**Round 1 — sign discovery.** Sapiens output convention is CAMERA space with non-standard sign: normals point AWAY from camera for surfaces facing camera, but the axis signs differ from PyTorch3D's camera normals. Ran an 8-flip SVD sweep (all 8 ±1 combinations of xyz flip signs applied to Sapiens normals before computing cosine similarity against rendered SMPL normals at ΔV=0):
+
+| Flip sign (x, y, z) | Mean cosine similarity |
+|---|---|
+| (+1, −1, −1) **winner** | 0.812 |
+| (−1, −1, −1) | 0.752 |
+| (+1, +1, −1) | 0.621 |
+| (−1, +1, −1) | 0.583 |
+| (+1, −1, +1) | 0.421 |
+| (−1, −1, +1) | 0.388 |
+| (+1, +1, +1) | 0.312 |
+| (−1, +1, +1) | 0.287 |
+
+Winner: `_SAPIENS_NORMAL_FLIP = (1, -1, -1)` — x positive, y flipped, z flipped. Codified as a module-level constant applied in `_load_sapiens_normals` before normalising.
+
+**Round 2 — diagnostic breakdown.** Computed cosine error separated by region at ΔV=0: face-on interior mean 0.060, edge region 0.41, grazing surfaces 0.53. 7× gap confirmed that edge/grazing pixels dominate the raw loss and corrupt the gradient signal — motivated the two-gate design.
+
+**Round 3 — grazing gate implementation.** Gate on |rendered_n_z| > 0.5 (threshold tunable, set conservatively for D12; D14 tuning target). Both rendered_n_z and the threshold boundary are detached from the gradient graph so ΔV gradient flows through the cosine dot product only, not through mask selection.
+
+**Round 4 — edge erosion gate.** Erode rendered_fg by 4 px via max_pool2d of the inverted fg mask (dilate background by 4 px, then invert). `.detach()` after erode. Combined mask: sapiens_fg & interior_gate & grazing_gate. Final mean cosine-distance loss on valid pixels only.
+
+### Tuning results so far (before D14)
+
+`w_lap` sweep at fixed other weights (silh=1.0, normal=0.5, etc.):
+- w_lap=100 (initial): mean hard-IoU gain +0.077 over baseline, turntable shows moderate roughness
+- w_lap=300: IoU gain +0.055, roughness unchanged
+- w_lap=500: IoU gain +0.028, roughness not reduced — confirms over-regularization suppresses silhouette fit without curing roughness
+
+After FIX1+FIX2: turntable torso dihedral p99 52° (vs ΔV=0 baseline 34°, vs pre-fix 60°). Median dihedral barely changed (5.18° → 5.23°) — roughness is a spike pattern, not global. Main cause unconfirmed.
+
+### Open issues going into D14
+
+**Issue 1 — Residual torso roughness (D14 acceptance target).** Turntable torso dihedral p99 ~52° vs ΔV=0 baseline 34°. FIX1 and FIX2 each helped ~4°; w_lap sweep showed under-regularization is not the cause (more Laplacian made IoU worse without clearing the spikes). Main cause still unconfirmed — candidates: (a) strong silhouette pull creating local spikes at feature boundaries with no adjacent-face smoothing constraint; (b) normal_consistency weight too low (0.1). D14 target: visibly reduce p99 through weight rebalancing.
+
+**Issue 2 — Overlay torso under-fit (D14 secondary target).** Mesh silhouette (green) fails to fill SAM mask contour (red) at torso. Classified as category (c): spread across the torso body (not just head/hands/feet which are D8-intentional). Torso FN ~50–75% across frames — the mesh is too narrow. Not a projection error, not a D8 weighting artifact. Cause: regularization (w_lap=100) is over-resisting the silhouette pull. Corroborated by w_lap sweep: lower w_lap → higher IoU gain, stronger torso fill. D14 primary lever: lower w_lap, raise w_silh.
+
+**Current loss weights going into D14** (in `config.py`):
+```
+silhouette: 1.0,  normal: 0.5,  keypoint: 1e-3,
+laplacian: 100.0,  symmetry: 0.01,  height: 10.0,  normal_consistency: 0.1
+```
+
+### D14 tuning log
+
+**⚠ D14 R1/R2/R3 below ran at h=170cm (wrong height — stored placeholder). All superseded by h=180 re-runs further below. Kept for diagnostic record only.**
+
+**D14 R1 — w_lap 100 → 25** (run `20260523_150104_m8`, all other weights unchanged; h=170, SUPERSEDED)
+
+| Metric | Init (ΔV=0) | R1 final | vs pre-D14 |
+|---|---|---|---|
+| Mean hard-IoU | 0.782 | 0.848 | +0.066 (was +0.077 at w_lap=100) |
+| Dihedral p99 (frame 0) | 69° | 117° | +48° vs init; pre-D14 ref was ~52° |
+| max\|ΔV\| | — | 0.183 m | |
+
+**Result: negative.** w_lap=25 is clearly too low. Two findings:
+1. **Roughness exploded**: p99 jumped +48° (69° → 117°). The Laplacian at w=100 was doing primary roughness suppression — not just resisting displacement. Visible severe mottling in turntable final strip (torso, limbs, feet).
+2. **Torso fill didn't improve**: IoU gain with w_lap=25 (+0.066) is slightly LESS than with w_lap=100 (+0.077). The torso under-fill bottleneck is NOT the Laplacian; it's elsewhere. The diagnosis "regularization over-resists torso fill" is incorrect or at least w_lap is not the active constraint.
+
+**Revised interpretation:** w_lap=100 was load-bearing for smoothness. Dropping to 25 harms both metrics. The torso fill gap persists regardless of Laplacian level. The silhouette loss is producing a large fraction of noisy gradient — vertex movement goes into surface jitter rather than better body fit.
+
+**D14 R2 — w_nc 0.1 → 2.0** (run `20260523_150744_m8`, w_lap back to 100, all else unchanged; h=170, SUPERSEDED)
+
+| Metric | Init (ΔV=0) | R2 final | R1 (w_lap=25) | pre-D14 (w_nc=0.1) |
+|---|---|---|---|---|
+| Mean IoU | 0.782 | 0.829 (+0.047) | 0.848 (+0.066) | — (+0.077) |
+| Dihedral p99 (frame 0) | 69° | 45° (−23°) | 117° (+48°) | ~52° |
+| max\|ΔV\| | — | 0.089 m | 0.183 m | 0.156 m |
+
+**Result:** w_nc=2.0 is an effective roughness knob — p99 dropped from 69° (init) to 45° (below init baseline), cleaner than anything w_lap tuning achieved. But 2.0 is too high: the mesh over-smoothed, max|ΔV| fell to 0.089 m, and IoU dropped to +0.047. Two endpoints now established:
+- w_nc=0.1 → IoU +0.077, p99 ~52° (under-smoothed)
+- w_nc=2.0 → IoU +0.047, p99 45° (over-smoothed, below init)
+
+The fit/smoothness tradeoff curve between 0.1 and 2.0 is untested. R3 sweeps the middle. Note: R1/R2 IoU comparisons to pre-D14 +0.077 were incorrect due to height mismatch (see correction above).
+
+**Height baseline correction:** All pre-D14 runs were invoked with `--height 180`, overriding the stored `height_cm=170.0` in stage1_result.npz. D14 R1/R2/R3 runs read the stored 170cm. The "+0.077 IoU" figure referenced throughout D14 was from a h=180cm run and is NOT comparable. The correct apples-to-apples baseline at h=170cm (w_nc=0.1) is: IoU +0.052, dihedral p99=85°. All D14 comparisons below use h=170cm.
+
+**D14 R3 — w_nc sweep: 0.3, 0.5, 0.8** (w_lap=100, h=170cm, all else unchanged; SUPERSEDED by h=180 re-runs below)
+
+Full comparison at h=170cm (wrong height — for diagnostic record only):
+w_nc=0.1: IoU +0.052, p99=85°; w_nc=0.3: +0.051, p99=70°; w_nc=0.5: +0.050, p99=58°; w_nc=0.8: +0.050, p99=54°. Qualitative finding (smoothness knob direction) holds at h=180; numbers superseded.
+
+---
+
+**D14 h=180 confirmed sweep** (correct height; bundle `20260522_001631_h180`)
+
+**Height fix:** `data/runs/20260522_001631_h180/stage1_result.npz` — corrected copy of the original bundle with `height_cm=180`. Built via `Stage1Result.load → dataclasses.replace(height_cm=180) → save`. Pixel paths (`keyframe_paths`, `mask_paths`, `normal_paths`) unchanged, still point at `20260522_001631/` tree. Original 001631 bundle untouched. All future tune.py calls use `20260522_001631_h180` as SOURCE_RUN.
+
+**Sweep: w_nc=0.1 / 0.5 / 0.8, w_lap=100, h=180**, dihedral measured on frame 0 posed mesh:
+
+| Setting | IoU gain | Dihedral p99 |
+|---|---|---|
+| Init (ΔV=0) | — | 69° |
+| w_nc=0.1 (baseline, run `20260523_153225_m8`) | +0.057 | 77° (worse than init) |
+| w_nc=0.5 (run `20260523_153318_m8`) | +0.056 | 61° |
+| **w_nc=0.8 (run `20260523_153400_m8`)** | **+0.056** | **54°** |
+
+**Result: w_nc=0.8 confirmed as sweet spot.** IoU cost vs baseline: −0.001. Roughness improvement: 77° → 54° (−23°, below the init mesh at 69°). Pattern consistent with h=170 sweep — height target affects IoU level but not smoothness mechanism. Turntable at w_nc=0.8: mesh broader than init, mild surface texture on torso/arms, feet retain some noise (D8 intentional downweighting), no spike pattern. Pending: commit w_nc=0.8 to config.py.
+
+### D14 locking experiment (diagnostic, not adopted)
+
+**Soft lock attempt (silh_weight=0 for locked joints):** Set `_SILH_WEIGHT_PER_JOINT` to 0.0 for head/hands/feet/ankles/pelvis/spine1/spine2 (11 joints). Rationale: SAM mask contamination at those regions drives runaway ΔV. Result: max|ΔV| 0.138 m → 0.137 m — essentially unchanged. Root cause: silhouette weight=0 removes the direct gradient for those vertices, but Laplacian coupling from adjacent unlocked leg vertices continues to move them. Masking the signal cannot prevent transitive coupling through w_lap=100.
+
+**Hard lock (gradient + data zeroed each iter):** Added two lines to the optimizer loop — `delta_v.grad[locked_indices] = 0.0` after backward+clip, `delta_v.data[locked_indices] = 0.0` after optimizer.step. `locked_indices` derived from `silh_region_weights == 0`, which corresponds to the same 11 joints above → 3628 / 6890 vertices (53%) pinned.
+
+Results (h=180, w_nc=0.8):
+- Init IoU: 0.782 | Final IoU: 0.801 | Gain: **+0.018**
+- max|ΔV|: **0.050 m** (down from 0.138 m)
+- Top-5 ΔV vertices: R_wrist (joint 21), spine3 (joint 9), L_knee (joint 4) — all legitimate body regions, no locked-vertex runaway
+
+**Finding:** Hard lock successfully eliminated the foot/ankle/pelvis runaway. But IoU gain fell from +0.056 (unlocked) to +0.018. Locking 53% of vertices — including the spine and pelvis which form most of the torso — removes the optimization budget needed to fit the torso to the silhouette. Even with only unlocked vertices free (thighs, arms, upper back), the mesh could not recover comparable IoU.
+
+This is the terminal experiment for D14. The high-opacity 4-view acceptance render confirmed the visual verdict: the locked-vertex sculpted mesh does not visibly improve on the β-only (ΔV=0) mesh, and introduces surface noise on the remaining free regions. The β-mesh already fits well enough that ΔV's marginal gain is not worth its artifacts.
+
+---
+
+## 2026-05-23 — M8 close-out
+
+### Decision: ΔV optimization NOT adopted for MVP
+
+**Evidence reviewed:** Full D14 tuning log (7 runs), high-opacity 4-view acceptance render (87% mesh opacity, 4 views × keyframe / β-mesh / sculpted-mesh), geometry turntable (init vs final, 12 views × 360°).
+
+**Verdict:** In the SMPL v1, 10-parameter β + free per-vertex ΔV [6890, 3] configuration, test-time ΔV optimization does not produce results worth adopting. Specific failure modes observed:
+
+1. **Runaway local deformation.** Without locking, max|ΔV| reached 0.138 m (14 cm) at foot/ankle vertices. SAM mask contamination at shorts waistband and shoe boundaries drove the silhouette gradient into physically implausible vertex displacement.
+
+2. **Lock → loss of fitting capacity.** Hard-locking the contaminated regions (53% of vertices) to prevent runaway reduced IoU gain from +0.056 to +0.018. The optimization can only fit where it has freedom; the contaminated regions are large enough that locking them removes the budget needed to fit the torso.
+
+3. **Regularization suppresses fit.** The w_nc sweep showed that sufficient smoothness (p99 < init baseline 69°) requires w_nc ≥ 0.8, which itself reduces IoU gain vs the baseline. The tradeoff between smoothness and fit cannot be resolved within the current free-ΔV formulation.
+
+4. **4-view render confirmation.** The acceptance render showed the sculpted mesh does not visually improve on the β-only mesh for any of the four views (back, left, front, right). In some views (side profile) the ΔV mesh is slightly worse (surface roughness visible). The β mesh already tracks the subject's silhouette well from Stage 1.
+
+**This is a valid engineering conclusion, not a failure.** M8 implemented and evaluated all seven loss terms (silhouette + region weights, normal-map, keypoint reprojection, Laplacian, symmetry, height, normal consistency) through a full D6–D14 diagnostic sequence. The outcome is that free per-vertex ΔV at SMPL v1 resolution is not the right shape refinement mechanism for this MVP. The evidence base is complete.
+
+### Recommended future direction
+
+Higher-capacity shape space rather than free ΔV. SMPL's 10 β parameters are too few to capture individual body shape variation (e.g. waist-to-hip ratio, limb proportions) without free ΔV to compensate, but free ΔV at 6890 vertices is too unconstrained without strong enough priors. The natural next step is **SMPL v2 / SMPL-X with ~300 shape parameters** (or similar high-β models like SMPL+H) — these encode a much richer shape prior learned from scan data, so per-vertex freedom is not needed for plausible individual variation. Record as the recommended path for the body-shape refinement capability.
+
+### Decided handling for current codebase
+
+- **Stage 2 code: retained, not deleted.** All seven loss terms, D6–D14 infrastructure (region weights, normal rendering, symmetry, height loss, keypoint reprojection), and the optimizer loop remain in `stage2.py`. The work is not discarded.
+- **delta_v: will be zeroed so Stage 3 receives a clean β mesh.** The exact mechanism (e.g. Stage2Result.delta_v = zeros, or a flag that skips the optimizer) is deferred to the next session.
+- **Stage 3 data contract:** Stage 3 will receive the β-shaped mesh (ΔV=0) from Stage 2. The shape parameters (β, θ) from Stage 1 remain the primary body representation for the MVP.
+
+### Uncommitted changes at M8 close
+
+`body_mvp/stage2.py` — **not committed.** Contains two experimental edits from this session:
+1. `_SILH_WEIGHT_PER_JOINT` extended with pelvis/spine1/spine2 zeros (soft-lock attempt)
+2. Hard-lock lines in the optimizer loop (gradient + data zeroing each iter)
+
+Neither edit is part of the adopted M8 state. They are diagnostic experiments recorded here. The next session can decide whether to revert them or repurpose the hard-lock infrastructure for the delta_v zeroing mechanism.
+
+`body_mvp/config.py` — **not committed.** Contains `"normal_consistency": 0.8` (D14 confirmed weight) and `"laplacian": 100.0`. These represent the final D14 weights but since ΔV is not adopted, committing them is not urgent. Defer to next session.
+
+`NOTES.md` — **not committed.** This entry plus the D14 log above.
