@@ -32,18 +32,23 @@ def weighted_silhouette_iou_loss(
     target_mask: torch.Tensor,   # [N, H, W] float, {0, 1}
     weight_map: torch.Tensor,    # [N, H, W] float, per-pixel weights ≥ 0
     eps: float = 1e-6,
+    per_frame: bool = False,
 ) -> torch.Tensor:
     """Weighted soft-IoU loss. weight_map scales each pixel's contribution to
     both intersection and union, reducing the gradient from regions where SAM
     mask contamination is expected (hair, shoes, sleeves). Averaged over N
     frames. Same min/max formulation as silhouette_iou_loss.
+
+    per_frame=True returns the [N] per-frame loss values (before .mean()) so
+    callers can apply their own frame-level weighting (e.g. orientation-balanced
+    weighting in optimize_vertex_offsets).
     """
     pmin = torch.minimum(pred_alpha, target_mask)
     pmax = torch.maximum(pred_alpha, target_mask)
     intersection = (pmin * weight_map).flatten(1).sum(dim=1)
     union = (pmax * weight_map).flatten(1).sum(dim=1) + eps
-    iou = intersection / union
-    return (1.0 - iou).mean()
+    loss = 1.0 - intersection / union   # [N]
+    return loss if per_frame else loss.mean()
 
 
 def hard_iou_per_frame(

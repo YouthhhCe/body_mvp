@@ -506,6 +506,64 @@ def _median_tz_cam_t(cam_t_raw: torch.Tensor) -> torch.Tensor:
     return cam_t
 
 
+def _frame_orientation_weights(
+    theta_per_frame_np: np.ndarray,  # [N, 24, 3]
+    device: str,
+) -> torch.Tensor:
+    """Per-frame silhouette weights that cancel azimuth over-sampling.
+
+    For a spinning-subject / fixed-camera video, hmr2's global_orient encodes
+    the subject's spin azimuth. Keyframe extraction can cluster frames at the
+    same azimuth (diagnosed on 001631: 4 of 12 frames within 7.4° at ±180°,
+    the subject's back), so back-torso vertices receive ~4× more silhouette
+    gradient than front or side vertices.
+
+    For each frame i: count[i] = number of frames j (including i) whose
+    circular azimuth distance from i is < bandwidth = 360°/(2N). Weight[i] =
+    1/count[i]. Clustered frames share the weight budget; isolated frames keep
+    weight 1.0.
+
+    Verified: on 001631 all four back frames fall within each other's 15°
+    window (max pairwise 8.3°) → each gets 0.25, summing to exactly 1.0, equal
+    to one isolated frame — exactly cancels the 4× oversampling.
+    """
+    N = theta_per_frame_np.shape[0]
+    go = theta_per_frame_np[:, 0, :]  # [N, 3] global_orient axis-angle
+
+    # Spin azimuth: project SMPL +Z through each frame's global_orient (Rodrigues).
+    azimuths = np.empty(N, dtype=np.float64)
+    for i, g in enumerate(go):
+        angle = np.linalg.norm(g)
+        if angle < 1e-6:
+            azimuths[i] = 0.0
+            continue
+        ax = g / angle
+        c, s = np.cos(angle), np.sin(angle)
+        # R @ [0,0,1]: only x and z components needed for arctan2
+        fwd_x = s * ax[1] + (1.0 - c) * ax[0] * ax[2]
+        fwd_z = c       + (1.0 - c) * ax[2] * ax[2]
+        azimuths[i] = np.arctan2(fwd_x, fwd_z)
+
+    bandwidth = np.pi / N  # = 360°/(2N) in radians
+
+    counts = np.zeros(N, dtype=np.int32)
+    for i in range(N):
+        for j in range(N):
+            d = abs(azimuths[i] - azimuths[j])
+            d = min(d, 2.0 * np.pi - d)  # circular distance
+            if d < bandwidth:
+                counts[i] += 1  # self (d=0) always counted
+
+    weights = (1.0 / counts).astype(np.float32)
+    logger.debug(
+        "frame_orient_weights: bandwidth={:.1f}° counts={} weights={}",
+        np.degrees(bandwidth),
+        counts.tolist(),
+        np.round(weights, 3).tolist(),
+    )
+    return torch.from_numpy(weights).to(device)
+
+
 def _load_sapiens_normals(
     stage1_result: "Stage1Result",
     render_hw: tuple[int, int],
@@ -1073,6 +1131,8 @@ def optimize_vertex_offsets(
     )
     fl_orig = torch.from_numpy(stage1_result.focal_length_per_frame).to(device).float()
 
+    frame_orient_weights = _frame_orientation_weights(stage1_result.theta_per_frame, device)
+
     # v_shape_only is beta-dependent but beta is frozen; compute once outside loop.
     # Used to re-construct v_canonical = v_template + v_shape_only + delta_v each iter.
     with torch.no_grad():
@@ -1153,7 +1213,8 @@ def optimize_vertex_offsets(
         alpha = renderer(meshes)[..., 3]                 # [N, Ht, Wt]
 
         rendered_normals, rendered_fg = _render_normal_map(meshes, normal_rasterizer)
-        L_silh   = weighted_silhouette_iou_loss(alpha, target_masks, weight_map)
+        per_frame_silh = weighted_silhouette_iou_loss(alpha, target_masks, weight_map, per_frame=True)
+        L_silh = (per_frame_silh * frame_orient_weights).sum() / frame_orient_weights.sum()
         L_lap    = laplacian_smoothing_loss(meshes)
         L_nc     = normal_consistency_loss(meshes)
         L_normal = normal_map_loss(
