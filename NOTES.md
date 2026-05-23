@@ -331,3 +331,14 @@ Neither edit is part of the adopted M8 state. They are diagnostic experiments re
 `body_mvp/config.py` — **not committed.** Contains `"normal_consistency": 0.8` (D14 confirmed weight) and `"laplacian": 100.0`. These represent the final D14 weights but since ΔV is not adopted, committing them is not urgent. Defer to next session.
 
 `NOTES.md` — **not committed.** This entry plus the D14 log above.
+
+---
+
+## 2026-05-24 — M8 code close-out
+
+**Done:** Stage 2 bypass implemented. Two files changed:
+
+- `body_mvp/stage2.py`: `run()` replaced with an MVP bypass — constructs `Stage2Result` directly with zero ΔV, `n_iterations=0`, empty `loss_history`, `initial_iou_per_frame=None`, `final_iou_per_frame=None`. No SMPL load, no render. Data contract updated: `initial_iou_per_frame` / `final_iou_per_frame` typed as `np.ndarray | None`; save/load uses key-presence in the npz as the "not measured" signal; round-trip check updated to handle None. `__post_init__` guard changed to `n_iterations >= 0`. Optimization infrastructure (`optimize_vertex_offsets`, all 7 loss terms) retained untouched.
+- `body_mvp/pipeline.py`: `save_silhouette_debug` call removed (init/final overlays identical at ΔV=0; function remains in `stage2.py` for manual REPL use). Stage 2 comment updated to describe the bypass.
+
+**config.py unchanged** — optimizer weights are irrelevant with bypass active; D14-confirmed values are in the NOTES above if re-enabling later.

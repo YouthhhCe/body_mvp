@@ -329,13 +329,8 @@ def run(
 
     logger.info("Stage 1 complete: run_id={}, n_frames={}", run_id, n_frames)
 
-    # Stage 2: ΔV optimization against masks. stage2.run does the
-    # optimization + persists Stage2Result + runs its own round-trip check.
+    # Stage 2 (MVP bypass): outputs zero ΔV without running optimization.
+    # stage2.run persists Stage2Result and runs its own round-trip check.
     stage2_result = stage2.run(result)
-
-    # Debug viz: per-frame init/final silhouette overlays.
-    # save_silhouette_debug is self-contained (re-renders both states);
-    # depends only on Stage1Result + Stage2Result.
-    stage2.save_silhouette_debug(result, stage2_result)
 
     return result, stage2_result

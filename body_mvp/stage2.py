@@ -126,13 +126,18 @@ _TURNTABLE_FOV: float = 30.0                   # field of view (degrees)
 
 @dataclass
 class Stage2Result:
-    """Aggregated output of Stage 2 minimal optimization (M7).
+    """Output of Stage 2.
 
-    ΔV is the per-vertex offset learned in canonical T-pose space. β and θ
-    are passed through from Stage 1 unchanged — Stage 3 needs all three to
-    reconstruct posed and canonical meshes. Optimization metadata
-    (final_loss, loss_history, n_iterations) is kept alongside for
-    debugging and M8 tuning.
+    MVP: Stage 2 is a bypass — delta_v is forced to zero and no optimization
+    runs. beta and theta_per_frame are passed through from Stage 1 unchanged
+    so Stage 3 can reconstruct posed and canonical meshes from the pure β mesh.
+
+    Optimization infrastructure (optimize_vertex_offsets and all loss terms)
+    is retained in this file but not called by run(). n_iterations=0 and an
+    empty loss_history are the bypass sentinels.
+
+    initial_iou_per_frame / final_iou_per_frame are None on the bypass path
+    (not measured). On an optimizer run they are [N] float32 arrays.
 
     Persisted to a single .npz at the run dir root via save_stage2_result;
     reload via load_stage2_result. Native numpy dtypes only, no pickle.
@@ -141,21 +146,21 @@ class Stage2Result:
     run_id: str
     run_dir: Path
 
-    # ΔV — the optimized per-vertex offset in canonical T-pose space.
+    # ΔV — per-vertex offset in canonical T-pose space (zero array in MVP bypass).
     delta_v: np.ndarray              # [6890, 3] float32
 
     # Pass-through from Stage 1 — Stage 3 consumes both to rebuild the mesh.
     beta: np.ndarray                 # [10]      float32
     theta_per_frame: np.ndarray      # [N, 24, 3] float32
 
-    # Optimization metadata.
+    # Optimization metadata. n_iterations=0 and empty loss_history on bypass.
     n_iterations: int
     final_loss: float
     loss_history: np.ndarray         # [T] float32 — total loss per iter
 
-    # Quality bars per frame (silhouette IoU before/after).
-    initial_iou_per_frame: np.ndarray  # [N] float32
-    final_iou_per_frame: np.ndarray    # [N] float32
+    # Silhouette IoU before/after optimization. None when not measured (bypass).
+    initial_iou_per_frame: np.ndarray | None  # [N] float32, or None
+    final_iou_per_frame: np.ndarray | None    # [N] float32, or None
 
     # Raw (pre-weight) per-term loss history. Keys e.g. "silhouette",
     # "laplacian"; each value is [T] float32. Empty dict is valid (no
@@ -164,8 +169,8 @@ class Stage2Result:
     per_term_history: dict[str, np.ndarray] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if self.n_iterations <= 0:
-            raise ValueError(f"n_iterations: must be > 0, got {self.n_iterations}")
+        if self.n_iterations < 0:
+            raise ValueError(f"n_iterations: must be >= 0, got {self.n_iterations}")
         if self.final_loss != self.final_loss:  # NaN
             raise ValueError("final_loss: must not be NaN")
 
@@ -182,8 +187,10 @@ class Stage2Result:
         if N <= 0:
             raise ValueError(f"theta_per_frame: leading dim must be > 0, got {N}")
         _check_shape("theta_per_frame", self.theta_per_frame, (N, 24, 3))
-        _check_shape("initial_iou_per_frame", self.initial_iou_per_frame, (N,))
-        _check_shape("final_iou_per_frame", self.final_iou_per_frame, (N,))
+        if self.initial_iou_per_frame is not None:
+            _check_shape("initial_iou_per_frame", self.initial_iou_per_frame, (N,))
+        if self.final_iou_per_frame is not None:
+            _check_shape("final_iou_per_frame", self.final_iou_per_frame, (N,))
 
         T = self.loss_history.shape[0]
         if T != self.n_iterations:
@@ -242,9 +249,14 @@ def save_stage2_result(result: Stage2Result, path: Path) -> None:
         # array-typed loss_history stays float32 per plan.
         final_loss=np.array(result.final_loss, dtype=np.float64),
         loss_history=result.loss_history.astype(np.float32),
-        initial_iou_per_frame=result.initial_iou_per_frame.astype(np.float32),
-        final_iou_per_frame=result.final_iou_per_frame.astype(np.float32),
     )
+    # IoU fields are None on the bypass path (not measured). Key absence in
+    # the npz is the "not measured" signal; load_stage2_result reconstructs
+    # None when the key is missing.
+    if result.initial_iou_per_frame is not None:
+        save_kwargs["initial_iou_per_frame"] = result.initial_iou_per_frame.astype(np.float32)
+    if result.final_iou_per_frame is not None:
+        save_kwargs["final_iou_per_frame"] = result.final_iou_per_frame.astype(np.float32)
     for name, arr in result.per_term_history.items():
         key = f"{_PER_TERM_PREFIX}{name}"
         if key in save_kwargs:
@@ -264,6 +276,7 @@ def load_stage2_result(path: Path) -> Stage2Result:
         for key in data.files
         if key.startswith(_PER_TERM_PREFIX)
     }
+    files = set(data.files)
     return Stage2Result(
         run_id=str(data["run_id"].item()),
         run_dir=Path(str(data["run_dir"].item())),
@@ -273,8 +286,8 @@ def load_stage2_result(path: Path) -> Stage2Result:
         n_iterations=int(data["n_iterations"].item()),
         final_loss=float(data["final_loss"].item()),
         loss_history=data["loss_history"],
-        initial_iou_per_frame=data["initial_iou_per_frame"],
-        final_iou_per_frame=data["final_iou_per_frame"],
+        initial_iou_per_frame=data["initial_iou_per_frame"] if "initial_iou_per_frame" in files else None,
+        final_iou_per_frame=data["final_iou_per_frame"] if "final_iou_per_frame" in files else None,
         per_term_history=per_term_history,
     )
 
@@ -298,7 +311,6 @@ def _verify_stage2_round_trip(original: Stage2Result, path: Path) -> None:
 
     array_fields = (
         "delta_v", "beta", "theta_per_frame", "loss_history",
-        "initial_iou_per_frame", "final_iou_per_frame",
     )
     for name in array_fields:
         a = getattr(original, name)
@@ -309,6 +321,21 @@ def _verify_stage2_round_trip(original: Stage2Result, path: Path) -> None:
             raise RuntimeError(f"round-trip dtype mismatch on {name}: {a.dtype} vs {b.dtype}")
         if not np.array_equal(a, b):
             raise RuntimeError(f"round-trip value mismatch on {name}")
+
+    for name in ("initial_iou_per_frame", "final_iou_per_frame"):
+        a = getattr(original, name)
+        b = getattr(loaded, name)
+        if (a is None) != (b is None):
+            raise RuntimeError(
+                f"round-trip mismatch on {name}: original={a!r} loaded={b!r}"
+            )
+        if a is not None:
+            if a.shape != b.shape:
+                raise RuntimeError(f"round-trip shape mismatch on {name}: {a.shape} vs {b.shape}")
+            if a.dtype != b.dtype:
+                raise RuntimeError(f"round-trip dtype mismatch on {name}: {a.dtype} vs {b.dtype}")
+            if not np.array_equal(a, b):
+                raise RuntimeError(f"round-trip value mismatch on {name}")
 
     orig_pt = original.per_term_history
     loaded_pt = loaded.per_term_history
@@ -1157,17 +1184,30 @@ def save_geometry_turntable(
 
 
 def run(stage1_result: Stage1Result) -> Stage2Result:
-    """M7 Stage 2 entry point. Optimizes ΔV against Stage 1's masks,
-    persists Stage2Result + loss_curve.png + per-frame overlays, runs the
-    round-trip self-check, returns the result. Mirrors stage1.run's
-    fail-loud persistence pattern.
+    """Stage 2 MVP bypass. Outputs zero ΔV without running optimization.
+
+    The optimization infrastructure (optimize_vertex_offsets, all loss terms)
+    is retained in this file for reference but not called here. Stage 3
+    receives the pure β mesh — body shape is captured entirely by Stage 1's
+    SMPL β parameters.
+
+    Mirrors stage1.run's fail-loud persistence pattern.
     """
     out_dir = stage1_result.run_dir / "stage2"
     out_dir.mkdir(exist_ok=True)
-    loss_curve_path = out_dir / "loss_curve.png"
 
-    result = optimize_vertex_offsets(
-        stage1_result, loss_curve_path=loss_curve_path,
+    N = stage1_result.n_frames
+    result = Stage2Result(
+        run_id=stage1_result.run_id,
+        run_dir=stage1_result.run_dir,
+        delta_v=np.zeros((6890, 3), dtype=np.float32),
+        beta=stage1_result.beta.astype(np.float32),
+        theta_per_frame=stage1_result.theta_per_frame.astype(np.float32),
+        n_iterations=0,
+        final_loss=0.0,
+        loss_history=np.zeros(0, dtype=np.float32),
+        initial_iou_per_frame=None,
+        final_iou_per_frame=None,
     )
 
     npz_path = stage1_result.run_dir / "stage2_result.npz"
@@ -1175,7 +1215,7 @@ def run(stage1_result: Stage1Result) -> Stage2Result:
     logger.info("Wrote {}", npz_path)
     _verify_stage2_round_trip(result, npz_path)
 
-    logger.info("Stage 2 complete: run_id={}", result.run_id)
+    logger.info("Stage 2 complete (MVP bypass): zero ΔV, run_id={}", result.run_id)
     return result
 
 
