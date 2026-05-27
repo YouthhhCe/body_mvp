@@ -403,3 +403,45 @@ Neither edit is part of the adopted M8 state. They are diagnostic experiments re
 **Verification note:** M9 was the first milestone taken from plan through close-out in a single session. Key process learnings: (1) experiment-before-code — shoulder axis/sign verified against the actual SMPL model before writing `_build_a_pose`; (2) source-ground rendering decisions — `BlendParams` chosen after reading PyTorch3D shader source, not from docs alone; (3) the stale-bundle bug was diagnosed via per-vertex mesh diff (bit-identical → ruled out code regression → traced to input data), not by code inspection.
 
 **Next:** M10 — Web viewer with rotate/zoom. The GLB and thumbnail from Stage 3 are the inputs.
+
+---
+
+## 2026-05-27 — M10 close-out
+
+**Done:** In-browser GLB viewer with orbit/zoom, matte-sculpture material, three-point lighting, contact shadow, and bounding-box-derived camera framing. Viewer loads any run's GLB via `?run=` query param (default: `20260527_165342`).
+
+**Key decisions:**
+
+- **Three.js vendored locally, not CDN.** The viewer must be self-contained — openable reliably regardless of network. Version 0.184.0, 7 files, 2.3 MB in `viewer/three/`. ES module import map in index.html points at local files. Dependencies discovered empirically: three.module.js → three.core.js, GLTFLoader → BufferGeometryUtils.js + SkeletonUtils.js. Initial vendoring missed these 3 transitive files; caught via browser 404s.
+
+- **Vertex normals computed in-viewer** (`geometry.computeVertexNormals()` after GLB load). The GLB exported by stage3.py carries bare geometry (POSITION only, no NORMALS, no material). Adding normals at export time would have touched the M9-validated pipeline — out of scope for M10. The in-viewer fix is equivalent and keeps the milestone boundary clean.
+
+- **Camera framing derived from bounding box, not hardcoded.** After GLB loads, `Box3.setFromObject()` → center + size, distance computed from FOV + aspect + margin (1.4×). Works for any mesh from any run. Initial hardcoded `camera.position.set(0, 1.0, 3.0)` caused the mesh to sit low with legs off the bottom edge; replaced in Slice 2.
+
+- **Ground plane at exact `box.min.y`.** Contact shadow is a `PlaneGeometry` with a canvas-generated radial gradient texture (256×256, dark center fading to transparent edge). Placed at the mesh's lowest vertex — no offset. A 5mm offset was tried and caused visible separation between feet and shadow.
+
+- **OrbitControls: damped, constrained.** `enableDamping: true`, `dampingFactor: 0.08`, `minDistance: 0.3×`, `maxDistance: 3.0×` fitted distance, `maxPolarAngle: PI/2 + 0.35` (~110°) — camera can dip slightly below horizontal but cannot go under the floor.
+
+- **Serving: local static server required.** `python -m http.server 8080` from project root. GLTFLoader uses `fetch()` internally; Chrome blocks `fetch()` of local files from `file://` origins. Confirmed empirically — not an assumption.
+
+- **Visual style: "matte sculpture" — chosen deliberately by the developer, not by Claude Code.** The viewer's look is a warm plaster/clay sculpture on a light-gray gradient background. Two other directions were considered and explicitly rejected:
+  1. Jade / frosted-glass look (Apple-Health style) — rejected as too clinical.
+  2. Sci-fi hologram look — rejected as too gimmicky, distracts from body shape.
+  Matte sculpture was chosen because it is the most restrained option — it keeps body shape clearly readable, feels like a studio reference tool rather than a consumer toy, and crucially avoids making the user feel their body is being judged. This matters for a health product where the user's relationship with their own body is sensitive.
+
+- **Material and lighting tuned by visual judgment in the browser.** The rendered appearance cannot be verified from code alone. Final values: `MeshStandardMaterial` roughness 0.65, metalness 0, color `#e8dcc8` (warm plaster). Three-point lighting: key `DirectionalLight` intensity 4.5 (warm white `#fff5ee`, right side), fill intensity 1.2 (cooler `#d8dde8`, left side), rim intensity 4 (white, behind/above), ambient 0.18. Background CSS radial gradient `#f2f0ec` → `#c5c0b8`. Key was initially 6 (too bright, right side blown out), reduced to 4.5. Ambient was initially 0.35 (shadows too filled, flattening contrast), reduced to 0.18. Roughness was initially 1.0 (too soft, body structure washed out), lowered to 0.65 for more volume in light transitions. Fill was initially 2 (key/fill ratio too narrow), lowered to 1.2.
+
+**Problems hit and resolved:**
+
+1. **Vendoring bug — three.module.js not self-contained.** Recent three.js (0.184.0) splits the build into three.module.js (re-exports) + three.core.js (the actual library). GLTFLoader additionally imports BufferGeometryUtils.js and SkeletonUtils.js from `examples/jsm/utils/`. Initially only vendored the three obvious files; browser 404s on the missing files caused blank page. Fixed by downloading all transitive dependencies (7 files total) and auditing every `from './...'` across the tree.
+
+2. **Stale server/cache after Slice 1.** User reported blank page after Slice 2 was written, but the code on disk was correct. Cause: a leftover `python -m http.server` on the original port serving a stale directory listing. Moving to a fresh port cleared it. Lesson: always kill old servers between slices when debugging viewer issues.
+
+3. **Hardcoded camera position.** Initial `camera.position.set(0, 1.0, 3.0)` / `lookAt(0, 0.9, 0)` placed the mesh too low — legs ran off the bottom edge. Fixed by computing camera from bounding box (Slice 2).
+
+4. **Ground plane floating below feet.** A 5mm Y offset (`box.min.y + 0.005`) created visible separation. Removed — shadow plane at exact `box.min.y`. No z-fighting observed.
+
+**Open questions:** None. M10 is complete.
+
+**Next:** M11 — Evaluation. Validate the full pipeline on 5+ volunteers, produce comparison renders, collect self-similarity scores.
+

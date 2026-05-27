@@ -234,9 +234,10 @@ Each stage lives in a single file by design. `body_mvp/` is a flat package, not 
   - Acceptance: GLB opens in a standard GLB viewer and shows a recognizable human in A-pose; `Stage3Result` has all defined fields populated correctly
   - Outcome: implemented. Display branch (A-pose LBS → GLB + 512×512 thumbnail), analysis branch (theta_natural via medoid frame, joints, quality report with 5 checks), all fields populated, round-trip self-check, pipeline runs end-to-end through Stage 3. Validated on fresh full-pipeline run 20260527_165342.
 
-- [ ] **M10 — Web viewer**
+- [x] **M10 — Web viewer**
   - Goal: in-browser viewer with rotate/zoom
   - Acceptance: user can interact with the mesh in a browser; material has some visual polish
+  - Outcome: implemented. Vendored three.js 0.184.0 (7 files, 2.3 MB) into `viewer/three/`. Viewer loads GLB via GLTFLoader with `?run=` query param, computes vertex normals on load. Bounding-box-derived camera framing (works for any run's mesh). Three-point lighting (key/fill/rim + ambient) on a matte `MeshStandardMaterial` (roughness 0.65, metalness 0) — plaster-sculpture look. Canvas-generated radial-gradient contact shadow on a ground plane. OrbitControls with damping, zoom limits, and maxPolarAngle to prevent under-floor orbits. CSS radial-gradient background. Tuned by visual judgment in-browser.
 
 - [ ] **M11 — Evaluation**
   - Goal: validate on multiple volunteers
@@ -261,7 +262,7 @@ Things that have bitten others working on similar pipelines:
 
 ## Current status
 
-M9 complete. Stage 3 dual output implemented: display branch produces a GLB + thumbnail of the β-only mesh in a conservative A-pose; analysis branch produces `theta_natural` (medoid-frame body pose with identity global_orient), canonical/natural joints, a 5-check `QualityReport`, and all pass-through fields from Stages 1-2. Pipeline runs end-to-end through all three stages from the CLI. Next: M10 (Web viewer).
+M10 complete. In-browser GLB viewer with orbit/zoom, matte-sculpture material, three-point lighting, contact shadow, and bounding-box-derived camera framing. Works for any run via `?run=` query param. Three.js 0.184.0 vendored locally (no CDN dependency). Next: M11 (Evaluation).
 
 ## Out of scope for MVP
 
