@@ -229,9 +229,10 @@ Each stage lives in a single file by design. `body_mvp/` is a flat package, not 
   - Acceptance: all 7 loss terms implemented and integrated; ΔV optimization evaluated via 4-view comparison renders and geometry turntable; adopt/reject decision made on the evidence
   - Outcome: ΔV optimization evaluated and NOT adopted for the MVP — free per-vertex ΔV at SMPL v1 resolution does not improve on the β-only mesh. See NOTES.md M8 close-out.
 
-- [ ] **M9 — Stage 3 dual output**
+- [x] **M9 — Stage 3 dual output**
   - Goal: produce display GLB + complete `Stage3Result`
   - Acceptance: GLB opens in a standard GLB viewer and shows a recognizable human in A-pose; `Stage3Result` has all defined fields populated correctly
+  - Outcome: implemented. Display branch (A-pose LBS → GLB + 512×512 thumbnail), analysis branch (theta_natural via medoid frame, joints, quality report with 5 checks), all fields populated, round-trip self-check, pipeline runs end-to-end through Stage 3. Validated on fresh full-pipeline run 20260527_165342.
 
 - [ ] **M10 — Web viewer**
   - Goal: in-browser viewer with rotate/zoom
@@ -260,9 +261,7 @@ Things that have bitten others working on similar pipelines:
 
 ## Current status
 
-M8 complete. Stage 2 full loss + tuning infrastructure (7 loss terms, region weights, normal rendering, etc.) has been fully implemented and verified. However, after empirical evaluation during M8 tuning, it was decided that test-time free ΔV optimization will NOT be adopted for the MVP due to local deformations and optimization trade-offs (detailed reasons are documented in NOTES.md). 
-
-For the MVP, Stage 2 acts as a pass-through that outputs a zero-initialized `delta_v`, meaning all body shape information is preserved strictly within the Stage 1 SMPL β parameters. Pipeline flow now proceeds directly to Stage 3 with a clean β mesh. Next: M9.
+M9 complete. Stage 3 dual output implemented: display branch produces a GLB + thumbnail of the β-only mesh in a conservative A-pose; analysis branch produces `theta_natural` (medoid-frame body pose with identity global_orient), canonical/natural joints, a 5-check `QualityReport`, and all pass-through fields from Stages 1-2. Pipeline runs end-to-end through all three stages from the CLI. Next: M10 (Web viewer).
 
 ## Out of scope for MVP
 

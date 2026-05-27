@@ -10,6 +10,7 @@ from body_mvp import stage1, stage2, stage3
 from body_mvp.config import NUM_KEYFRAMES, settings
 from body_mvp.stage1 import Stage1Result
 from body_mvp.stage2 import Stage2Result
+from body_mvp.stage3 import Stage3Result
 
 
 def _create_run_dir(run_id: str) -> Path:
@@ -218,7 +219,7 @@ def _verify_round_trip(original: Stage1Result, path: Path) -> None:
 
 def run(
     video_path: Path, height: float, weight: float, gender: str
-) -> tuple[Stage1Result, Stage2Result]:
+) -> tuple[Stage1Result, Stage2Result, Stage3Result]:
     now = datetime.now()
     run_id = now.strftime("%Y%m%d_%H%M%S")
     run_dir = _create_run_dir(run_id)
@@ -333,4 +334,8 @@ def run(
     # stage2.run persists Stage2Result and runs its own round-trip check.
     stage2_result = stage2.run(result)
 
-    return result, stage2_result
+    # Stage 3: dual output — display GLB + complete Stage3Result for Layer 2.
+    # stage3.run persists Stage3Result and runs its own round-trip check.
+    stage3_result = stage3.run(result, stage2_result)
+
+    return result, stage2_result, stage3_result

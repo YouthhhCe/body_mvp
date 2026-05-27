@@ -60,7 +60,7 @@ Dated, append-only log of what happened, decisions made, parameters tried, open 
 ### Before ending a session
 - Update PROJECT.md if a milestone was completed (checkbox + Current status)
 - Append a new dated entry to NOTES.md summarizing what happened, decisions made, open questions
-- Suggest a one-line git commit message
+- Suggest a one-line git commit message — but do NOT run git yourself. All git operations (commit, tag, push) are done manually by the developer. Never run git commit/tag/push, even when the change is correct and the session is wrapping up.
 
 ---
 

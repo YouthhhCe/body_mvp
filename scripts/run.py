@@ -18,7 +18,7 @@ def main(video_path: Path, height: float, weight: float, gender: str) -> None:
     """Reconstruct a 3D body mesh from a spinning video."""
     logger.remove()
     logger.add(lambda msg: click.echo(msg, err=True), level=settings.log_level, colorize=True)
-    s1, s2 = pipeline.run(video_path, height, weight, gender)
+    s1, s2, s3 = pipeline.run(video_path, height, weight, gender)
 
     beta_str = "[" + ", ".join(f"{x:.3f}" for x in s1.beta) + "]"
     logger.info("Stage 1 result:")
@@ -39,6 +39,15 @@ def main(video_path: Path, height: float, weight: float, gender: str) -> None:
             float(s2.final_iou_per_frame.mean() - s2.initial_iou_per_frame.mean()),
         )
     logger.info("  max|ΔV|: {:.5f}", float(np.abs(s2.delta_v).max()))
+
+    logger.info("Stage 3 result:")
+    logger.info("  stage3_result.npz: {}", s3.run_dir / "stage3_result.npz")
+    logger.info("  glb: {}", s3.glb_path)
+    logger.info("  thumbnail: {}", s3.thumbnail_path)
+    logger.info("  theta_natural first 3 joints: [{:.3f}, {:.3f}, {:.3f}]", *s3.theta_natural[1])
+    logger.info("  quality score: {:.2f} ({} warnings)", s3.quality.overall_score, len(s3.quality.warnings))
+    for w in s3.quality.warnings:
+        logger.info("    - {}", w)
 
 
 if __name__ == "__main__":

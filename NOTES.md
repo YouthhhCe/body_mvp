@@ -357,3 +357,49 @@ Neither edit is part of the adopted M8 state. They are diagnostic experiments re
 **Actual end-to-end behavior:** `pipeline.run()` ends after Stage 2 with `return result, stage2_result`. There is no Stage 3 call anywhere in the function. The CLI completing through Stage 2 and exiting normally is the M8 acceptance. Earlier planning notes that referred to "Stage 3 hitting its NotImplementedError" were a wrong prediction made without checking the code.
 
 **Process note:** commit a7ae846 was made by Claude Code without approval. Per CLAUDE.md, commits are made manually by the developer. This should not recur.
+
+---
+
+## 2026-05-27 — M9 close-out
+
+**Done:** Stage 3 dual output fully implemented in `body_mvp/stage3.py`. Pipeline wired end-to-end through Stage 3 in `pipeline.py` and `scripts/run.py`. Validated on fresh full-pipeline run `20260527_165342` (test.mp4, height=180, weight=75, gender=neutral).
+
+**Key decisions:**
+
+- **`Stage3Result`**: all 15 fields per the PROJECT.md data contract, fully populated — no `| None` fields. `QualityReport` flattened into `quality_score` (float64 for bit-exact round-trip) + `quality_warnings` (string array) in the npz. Save/load/round-trip pattern mirrors Stage 1 and Stage 2.
+
+- **Display branch**: A-pose via SMPL LBS with shoulder Z-rotation ±0.6 rad (arm depression angle not separately measured; the A-pose silhouette was visually confirmed in the rendered thumbnail). Conservative angle chosen to minimize LBS candy-wrap (pitfall #4). Verified experimentally against the SMPL model: L_shoulder (16) −Z = arm down, R_shoulder (17) +Z = arm down. GLB exported via trimesh. Thumbnail rendered at 512×512 via PyTorch3D `HardPhongShader` + `DirectionalLights`, front canonical view (camera on +Z, elev=0, FOV=40°), white background via `BlendParams(background_color=(1,1,1))`. No R_180x flip — this is a standalone render, not passing through the Stage 2 per-frame camera path.
+
+- **Analysis branch — theta_natural**: medoid frame selection on body_pose (joints 1-23). Pairwise squared Frobenius distance on rotation matrices (`pytorch3d.transforms.axis_angle_to_matrix`). global_orient set to identity. Medoid chosen over geodesic rotation averaging: simpler, produces a physically observed (not blended) pose, naturally robust to outlier frames. On the M9 test run, frame 6 was the medoid (sum-of-distances = 12.03).
+
+- **joints_canonical**: `J_regressor @ v_canonical` — rest-pose joint centres from the SMPL joint regressor applied directly to the canonical mesh. Same source as the rest-pose joints inside `smplx.lbs.lbs()`. `joints_natural`: posed joints from LBS with `theta_natural`, no translation.
+
+- **scale_to_meters = 1.0**: SMPL vertex coordinates are natively in metres. Confirmed by measurement: canonical mesh Y-span = 1.7687 m for height_cm=180 (ratio 0.983). This is a fixed SMPL convention, not derived from the measurement.
+
+- **QualityReport — 5 checks**: (1) mask coverage (mean < 0.05 or any frame < 0.02 — thresholds deliberately looser than M3's 9% re-processing gate; these are post-hoc quality signals for Layer 2, not remediation triggers); (2) β plausibility (any |β_k| > 3.5); (3) per-frame tz spread (> 15% of median); (4) keyframe angular coverage (max azimuth gap > 90°, same Rodrigues azimuth method as stage2._frame_orientation_weights); (5) A-pose mesh height vs target (> 10 cm). Check 5 is NOT circular with scale_to_meters — scale_to_meters is the fixed SMPL convention, not derived from Y-span/height_cm. Score: 1.0 − 0.06 × n_warnings, floor 0.0.
+
+- **`_pose_to` lives in stage3.py**, not a refactored shared helper in lbs.py. Duplicates the LBS pattern from stage2._pose_meshes but without cam_t, Meshes construction, or batch-N rendering concerns. ~25 lines each — duplication cheaper than the wrong abstraction.
+
+**Implementation notes:**
+
+- Renders use `BlendParams(background_color=(1,1,1))` for white background, not manual alpha compositing. `HardPhongShader` alpha IS {0,1} with `blur_radius=0.0` (verified from PyTorch3D source), but relying on shader alpha semantics is brittle. BlendParams is the intended API.
+
+- `smpl_model.faces` is numpy uint32; `_compute_canonical` converts to int64 via `.astype(np.int64)` before returning. The raw SMPL model's `faces_tensor` is already torch int64.
+
+- `render_thumbnail` takes an explicit `device` arg; `compute_theta_natural` accesses `settings.device` directly (standalone, callable outside the orchestrator). The orchestrator uses `settings.device` consistently for SMPL loading and passes it to callees.
+
+**Known issues / pitfalls surfaced during M9:**
+
+- **Stale bundle `20260522_001631_h180`**: this bundle's `stage2_result.npz` was created during D14 tuning (`n_iterations=200`, 9,786 non-zero ΔV entries, max|ΔV|=0.050m from the hard-lock experiment), predating the M8 bypass. It must NOT be used as a Stage 3 input — it carries pre-bypass ΔV that introduces surface artifacts. The M9 validation run is `20260527_165342`, a fresh full-pipeline run with a genuine zero-ΔV bypass Stage 2. The _h180 bundle was created for D14 height-correction by re-saving only `stage1_result.npz`; `stage2_result.npz` was copied as-is from the D14 tuning run and was never re-generated post-bypass.
+
+- **`--gender` CLI parameter is not consumed**: only the neutral SMPL model exists in the checkpoints. `gender` is stored as metadata on `Stage1Result` but never switches the SMPL model or affects any computation. The CLI accepts it and the pipeline passes it through, but it has no runtime effect.
+
+- **Open item (deferred): stage3.run() does not guard against non-zero delta_v input**. If called with a stale `Stage2Result` carrying pre-bypass ΔV, `stage3.run()` silently applies it, producing a degraded mesh. A fail-loud check (`assert delta_v max abs < epsilon` or explicit raise) would catch this. NOT silent zeroing — `Stage3Result.delta_v` is a cross-layer contract field and the consumer should not mask bad upstream input. Deferred; a future session can add the guard.
+
+- **`QualityReport` check 2 (β plausibility) returns after first outlier**: if multiple β components exceed ±3.5, only the first is named in the warning. One warning is sufficient to flag and dock the score; listing all adds no actionable signal for Layer 2.
+
+**Validation:** Run `20260527_165342` — full pipeline from test.mp4 → Stage 1 (12 keyframes, β matches reference, masks 9.4-14.9%) → Stage 2 (iters=0, max|ΔV|=0.0, genuine bypass) → Stage 3 (GLB 243 KB, thumbnail 512×512, quality score 1.00, zero warnings). All three stage round-trip self-checks passed. GLB visually confirmed — recognizable A-pose human.
+
+**Verification note:** M9 was the first milestone taken from plan through close-out in a single session. Key process learnings: (1) experiment-before-code — shoulder axis/sign verified against the actual SMPL model before writing `_build_a_pose`; (2) source-ground rendering decisions — `BlendParams` chosen after reading PyTorch3D shader source, not from docs alone; (3) the stale-bundle bug was diagnosed via per-vertex mesh diff (bit-identical → ruled out code regression → traced to input data), not by code inspection.
+
+**Next:** M10 — Web viewer with rotate/zoom. The GLB and thumbnail from Stage 3 are the inputs.
