@@ -445,3 +445,169 @@ Neither edit is part of the adopted M8 state. They are diagnostic experiments re
 
 **Next:** M11 — Evaluation. Validate the full pipeline on 5+ volunteers, produce comparison renders, collect self-similarity scores.
 
+---
+
+## 2026-05-28 — M11 finding: shape space inadequacy
+
+3 名志愿者全部重建后明显不像本人。代表性失败模式:肌肉男罗尼库尔曼（宽肩细腰厚粗手臂）被重建为脂肪型胖子(躯干厚、肚子凸、四肢细)。
+
+诊断假设:SMPL 10 维 β 是 CAESAR 数据集上的 PCA basis,
+β_2(围度轴)在该数据集上学到的是"脂肪型增重"模式,
+PCA 空间内不存在"肌肉发达 vs 脂肪发达"独立方向。
+4D Humans 已找到该空间内最接近的解,问题不在上游 regressor。
+
+推论:
+- Stage 2 改为优化 β(而非 ΔV)无法解决该问题——10 维 PCA
+  空间内没有目标方向可搜。
+- SMPL-X 扩展面部+手部,body shape 表达力与 SMPL 相同,
+  也无法解决。
+- 真正解决方向需更换 body shape model(GHUM / STAR / SUPR /
+  自训练 PCA 等),属项目级方向变更,远超 M11 范围。
+
+决策推迟。M11 不在此时拍板方向。明天清醒状态下重审,
+诊断步骤待定(可能包括:看 stage1 中间产物分清是 Stage 1 错
+还是 shape space 错;阅读 SMPL 论文确认前 3 维含义;研究
+替代 body model 现状)。
+
+不要在本条目下补任何决策。下一条目应是明天的诊断结果。
+
+---
+
+## 2026-05-28 — M11 finding: shape inadequacy + per-bone scaling probe
+
+**Context:** M11 evaluation on real volunteers. 3 muscular subjects
+reconstructed from the existing pipeline all looked clearly unlike
+themselves. Representative failure mode: a muscular build ("肩宽腰细",
+broad shoulders / narrow waist) is reconstructed as a uniformly fat
+build (thick waist).
+
+**Root-cause hypothesis (refined):** The problem is NOT surface detail
+(muscle striations) and NOT the upstream regressor finding a wrong β.
+It is that SMPL's 10-dim β is a PCA basis over CAESAR; its girth axis
+couples shoulders/waist/hips together (whole-body "fatter"), so it
+cannot represent decoupled per-region girth like broad-shoulder +
+narrow-waist. 4D Humans already returns the closest β in that space;
+the target build simply does not exist in 10-dim β space.
+
+**Implication for earlier ideas (all rejected):**
+- Optimizing β instead of ΔV (Stage 2 rework): does NOT help — the
+  target build is not reachable in 10-dim β space, no amount of search
+  finds it.
+- SMPL-X: extends face + hands only; body shape expressiveness is the
+  same as SMPL. Does not help.
+- Re-running M8 free ΔV: already evaluated and rejected in M8.
+
+**Candidate direction under evaluation: per-bone "blind" thickness
+scaling.** Decouple per-region girth by scaling each limb/segment
+independently to match the SAM silhouette, instead of relying on β.
+This is a project-level change (would alter Stage 2/3, reopening a
+closed milestone) and is being evaluated in data/experiments/ ONLY —
+no pipeline code touched.
+
+**Scope decision recorded:** For M11 / MVP demo, the accepted goal is
+"recognizable silhouette in the viewer" (marketing hook). Geometric
+fidelity of the data handed to Layer 2 is explicitly deprioritized for
+now — a per-bone-scaled mesh is no longer a pure-β SMPL mesh, so the
+Stage3Result contract (beta / vertices_canonical) would carry a known
+inconsistency. This is a deliberate trade-off, NOT an oversight. The
+Layer-2 data debt is deferred and must be revisited before Layer 2
+work begins.
+
+**Probe result (data/experiments/probe_arm_thickness.py):** Tested
+whether SMPL supports clean per-bone thickness scaling of one limb
+(right upper arm, joints 17→19) without breaking the joint seam.
+Ground-truthed from smplx source: model.lbs_weights is [6890, 24],
+SOFT (rows sum to 1, ~4 nonzero joints per vertex; 264 vertices with
+right-shoulder weight > 0.5, 1708 with any nonzero weight).
+Two variants rendered:
+- Variant A (hard: scale vertices with weight > 0.5): seam looks wrong
+  / has a visible discontinuity at the shoulder (visual judgment by
+  developer).
+- Variant B (soft: per-vertex scale = 1 + 0.5·weight, applied to the
+  component perpendicular to the bone axis): smooth, seam intact.
+**Conclusion: the deformation mechanism works, but ONLY as per-vertex
+weighted scaling (Variant B). This corrects the original scheme write-
+up, which described "multiply into the joint's X/Z scale matrix" —
+that hard/matrix approach would break the seam.** Visual judgment by
+developer (CC cannot see renders).
+
+**Still UNVERIFIED (next experiment, in data/experiments/ only):**
+1. End-to-end: measure widths from a 2D mask → derive per-segment
+   scale factors → apply multi-segment soft scaling → render.
+2. Whether the waist (spine segments) can be scaled DOWN independently
+   without breaking the chest–waist and waist–pelvis seams. This is
+   the real test of "broad shoulders + narrow waist" — the probe only
+   tested an end-limb (arm), not a core segment with seams on both ends.
+3. Whether multiple simultaneous segment scalings interfere at shared
+   seams.
+Test input: the Ronnie Coleman photo (extreme broad-shoulder/narrow-
+waist, near A-pose) — the hardest case, good acceptance sample.
+
+**Decision status: NOT decided.** Mechanism is promising but the
+end-to-end path and the waist-narrowing case are unproven. No pipeline
+change, no milestone reopened until end-to-end evidence exists.
+
+---
+
+## 2026-05-28 — M11: per-bone scaling end-to-end probe (multi-segment)
+
+**Context:** Following the single-arm probe (same day, above), tested
+whether multi-segment soft scaling can produce a decoupled 倒三角
+(broad-shoulder/narrow-waist) build — the build SMPL's 10-dim β cannot
+represent. Experiment only, data/experiments/probe_body_build.py, no
+pipeline code touched.
+
+**Mechanism (ground-truthed from smplx source):** SMPL joint positions
+are a derived quantity, J = J_regressor @ V (lbs.py:209), NOT free
+parameters. In canonical theta=0, LBS is identity, so "move a joint and
+re-skin" produces zero lateral spread. Therefore shoulder-span widening
+must be done by DIRECT vertex translation (lateral X-displacement
+weighted by the shoulder skinning-weight column), not by moving the
+joint. Recorded so this dead end isn't retried.
+
+**Operations applied (hand-supplied factors, additive displacement
+v' = v + Σ_j δ_j(v), each δ_j using that joint's own bone axis):**
+- thighs (1,2) ×1.4, calves (4,5) ×1.2, upper arms (16,17) ×1.5,
+  waist spine1/spine2 (3,6) ×0.7 — all perp-to-bone scaling
+- shoulders (16,17) ±10cm lateral X translation — span widening
+- spine3 (9) left untouched to preserve chest breadth
+
+**Result — mechanism VERIFIED, all critical questions passed:**
+- Multi-segment soft scaling works; no interference between segments.
+- Waist scaled down independently with BOTH the chest-side and
+  pelvis-side seams remaining smooth (no step/pinch/distortion) —
+  confirmed on the waist close-up render. This was the make-or-break
+  question for the 倒三角 case. Verified by developer's eyes (CC cannot
+  see renders); decision-layer read agreed.
+
+**Result — current factors do NOT yet reproduce Ronnie (non-mechanism
+issues):**
+- The hand-tuned factors produce a pear/hourglass (female-ish) build:
+  waist narrowed but hips/thighs flared too wide. This is a FACTOR-
+  TUNING issue, not a mechanism issue. Hand factors are placeholders
+  anyway (real system must derive them from the mask).
+- Shoulder-span widening via lateral vertex translation looks weak /
+  produces a local bump at the acromion rather than a naturally
+  widened shoulder line. Open technical issue: the span-widening
+  operation needs a better implementation.
+
+**Bottom line:** per-bone scaling CAN produce decoupled body builds
+that 10-dim β cannot — the path is mechanically viable. "Make it look
+like Ronnie" is now tuning + better shoulder op, not a mechanism
+question.
+
+**Unresolved before this could become real:**
+1. Shoulder-span widening: current direct-translation op is unnatural;
+   needs rethinking.
+2. Width measurement automation: deriving scale factors from the SAM
+   mask (incl. multi-view frame selection for width vs depth) — not a
+   single line written yet; this is the other half of end-to-end.
+3. Stage3Result contract impact: a per-bone-scaled mesh is not a pure-β
+   SMPL mesh; Layer-2 data debt (recorded in the earlier entry today)
+   stands.
+
+**Decision status: STILL NOT decided.** Mechanism is proven viable, but
+making per-bone scaling part of the pipeline means reopening the closed
+M8 and changing Stage 2/3 — a project-level scope change requiring
+explicit sign-off. No pipeline change, no milestone reopened. This is
+a viability finding, not a go decision.
