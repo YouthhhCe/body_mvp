@@ -611,3 +611,22 @@ making per-bone scaling part of the pipeline means reopening the closed
 M8 and changing Stage 2/3 — a project-level scope change requiring
 explicit sign-off. No pipeline change, no milestone reopened. This is
 a viability finding, not a go decision.
+
+## 2026-05-28 — M11 close-out
+
+M11 closed as "pivoted." The two probe entries above (shape inadequacy
++ per-bone scaling probes) are the substantive record; this entry just
+marks the milestone boundary.
+
+PROJECT.md updated: M11 ticked (pivoted), Current status rewritten, M12
+(planning) added. The decision chain (why SMPL β is inadequate, why
+optimizing β / SMPL-X / free-ΔV were rejected, why per-bone scaling,
+the height-as-ruler insight, the display/analysis split) was reached
+entirely at the decision-review layer — recorded by the developer, not
+CC, since CC did not participate in the direction decisions (it only
+ran the probes).
+
+Tag: m11-end.
+
+Next: M12 — plan the per-bone-scaling direction as a whole before any
+implementation.

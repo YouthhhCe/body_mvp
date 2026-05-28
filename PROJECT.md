@@ -239,9 +239,13 @@ Each stage lives in a single file by design. `body_mvp/` is a flat package, not 
   - Acceptance: user can interact with the mesh in a browser; material has some visual polish
   - Outcome: implemented. Vendored three.js 0.184.0 (7 files, 2.3 MB) into `viewer/three/`. Viewer loads GLB via GLTFLoader with `?run=` query param, computes vertex normals on load. Bounding-box-derived camera framing (works for any run's mesh). Three-point lighting (key/fill/rim + ambient) on a matte `MeshStandardMaterial` (roughness 0.65, metalness 0) — plaster-sculpture look. Canvas-generated radial-gradient contact shadow on a ground plane. OrbitControls with damping, zoom limits, and maxPolarAngle to prevent under-floor orbits. CSS radial-gradient background. Tuned by visual judgment in-browser.
 
-- [ ] **M11 — Evaluation**
-  - Goal: validate on multiple volunteers
-  - Acceptance: for 5+ subjects, produce comparison renders and collect self-similarity scores
+- [x] **M11 — Evaluation (pivoted)**
+  - Goal (original): validate on 5+ volunteers, comparison renders + self-similarity scores
+  - Outcome: the original evaluation was cut short by a more fundamental finding. The first real, varied subjects (3 muscular builds) were all clearly unrecognizable — a broad-shoulder/narrow-waist build reconstructs as a uniformly fat one. Root cause: SMPL's 10-dim β is a CAESAR PCA basis whose girth axis couples shoulders/waist/hips, so it cannot represent decoupled per-region girth. This is a model-expressiveness limit, not a bug; 4D Humans already returns the closest β. Optimizing β, SMPL-X, and re-running M8 free-ΔV were all reasoned through and rejected. A per-bone soft-scaling approach (scale each segment independently to the mask, decoupling region girths) was probed in data/experiments/ and the deformation mechanism verified: multi-segment soft scaling holds, the waist scales down independently with both seams intact. Collecting self-similarity scores on the current pipeline was abandoned as meaningless (subjects don't recognize themselves). See NOTES.md 2026-05-28. The per-bone-scaling direction is taken up as a planning phase in M12.
+
+- [ ] **M12 — Shape-refinement direction: planning**
+  - Goal: design the per-bone-scaling direction as a whole before implementing — data-flow split (display line vs analysis line), where width/girth measurement lives, Stage 2/3 redefinition, Stage3Result contract changes, and the milestone breakdown that follows. Planning/design only, no pipeline code.
+  - Note: driven by the decision-review layer (developer + advisor), not Claude Code. CC engages only for targeted ground-truth checks.
 
 ---
 
@@ -262,7 +266,7 @@ Things that have bitten others working on similar pipelines:
 
 ## Current status
 
-M10 complete. In-browser GLB viewer with orbit/zoom, matte-sculpture material, three-point lighting, contact shadow, and bounding-box-derived camera framing. Works for any run via `?run=` query param. Three.js 0.184.0 vendored locally (no CDN dependency). Next: M11 (Evaluation).
+M11 pivoted. Evaluation on real volunteers revealed that SMPL's 10-dim β cannot represent muscular (decoupled-girth) builds — subjects are unrecognizable. A per-bone soft-scaling direction was probed and its deformation mechanism verified in data/experiments/ (not in the pipeline). Key design decisions reached at the decision-review layer: height is used as a scale reference to convert mask pixel-widths into real-cm girths; those real girths are first-class data feeding both Layer-2 body analysis and the display-line scaling factors; the display line (β mesh → per-bone scaling → Sapiens-normal surface detail → A-pose → GLB) is kept strictly separate from the analysis line (raw Stage-1 β/θ/joints/mask + measured girths → Layer 2), so scaling never pollutes Layer-2 data; Stage 1 is reused unchanged. Not yet decided/built: width-measurement automation (the 2D→3D girth problem, incl. depth from side views), a natural shoulder-span operation, and the Stage 2/3 / Stage3Result restructuring. Next: M12 (planning).
 
 ## Out of scope for MVP
 
