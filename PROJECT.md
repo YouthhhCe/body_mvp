@@ -1,5 +1,17 @@
 # Body MVP
 
+> **⚠️ ARCHIVED / PAUSED (2026-05-28).** Layer 1 (3D body reconstruction)
+> is paused on commercial-licensing grounds: its core components (SMPL/
+> smplx, 4D Humans, Sapiens) are non-commercial and commercial clearance
+> proved unworkable for an individual developer. The pipeline runs end-to-
+> end through Stage 3 and the M11/M12 technical findings (per-bone scaling,
+> anisotropic torso, two-stills design) are preserved as pre-research for a
+> future 3D attempt — see NOTES.md 2026-05-28. The product effort pivots to
+> a SEPARATE Layer 2/3 venture (commercially-friendly 2D tools, revenue
+> first); that work does NOT live in this repo. This repo is a sealed
+> Layer-1 archive.
+
+
 > *This file is the project snapshot — what we're building, the architecture, current status. For how to maintain it (and the relationship to CLAUDE.md / NOTES.md), see CLAUDE.md.*
 
 ## Bigger picture: where this fits
@@ -266,7 +278,24 @@ Things that have bitten others working on similar pipelines:
 
 ## Current status
 
-M11 pivoted. Evaluation on real volunteers revealed that SMPL's 10-dim β cannot represent muscular (decoupled-girth) builds — subjects are unrecognizable. A per-bone soft-scaling direction was probed and its deformation mechanism verified in data/experiments/ (not in the pipeline). Key design decisions reached at the decision-review layer: height is used as a scale reference to convert mask pixel-widths into real-cm girths; those real girths are first-class data feeding both Layer-2 body analysis and the display-line scaling factors; the display line (β mesh → per-bone scaling → Sapiens-normal surface detail → A-pose → GLB) is kept strictly separate from the analysis line (raw Stage-1 β/θ/joints/mask + measured girths → Layer 2), so scaling never pollutes Layer-2 data; Stage 1 is reused unchanged. Not yet decided/built: width-measurement automation (the 2D→3D girth problem, incl. depth from side views), a natural shoulder-span operation, and the Stage 2/3 / Stage3Result restructuring. Next: M12 (planning).
+ARCHIVED / PAUSED (2026-05-28). Technically, the pipeline runs end-to-end
+through Stage 3 (M10 complete). M11 (evaluation) pivoted: real volunteers
+revealed SMPL's 10-dim β cannot represent muscular/decoupled builds. M12
+(planning) explored a per-bone-scaling redesign and verified its mechanism
+across three probes in data/experiments/ (soft scaling, multi-segment with
+independent waist, anisotropic torso), with one open limitation (uniform
+axial torso scaling produces non-human shapes; torso shaping deferred). No
+pipeline code was changed during M11/M12 — all exploration stayed in
+data/experiments/.
+
+The project is then paused on commercial-licensing grounds (non-commercial
+core: SMPL/smplx, 4D Humans, Sapiens; commercial clearance unworkable for
+a solo developer; third-party 3D APIs enterprise-priced). The product
+effort pivots to a separate Layer-2/3 venture built on commercially-
+friendly tools (revenue first); that is a new project, not this repo. All
+M11/M12 findings are preserved as pre-research (NOTES.md 2026-05-28) so a
+future 3D attempt — with a team or affordable licensing — can resume from
+here. See NOTES.md 2026-05-28 for the full decision.
 
 ## Out of scope for MVP
 

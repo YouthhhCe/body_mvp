@@ -630,3 +630,121 @@ Tag: m11-end.
 
 Next: M12 — plan the per-bone-scaling direction as a whole before any
 implementation.
+
+## 2026-05-28 — M12 planning (session 1): per-bone scaling direction
+
+Planning phase, decision-review layer (developer + advisor). No pipeline
+code. Building on the M11 pivot and the two probes (same day, above).
+
+### Analysis line (handed to Layer 2; Layer 1 does NOT extract features)
+- Posture: reuse Stage 1 theta/joints directly (4D Humans' contribution).
+- Body shape: Layer 1 does NOT compute features (九头身/倒三角/啤酒肚 etc.) —
+  that is Layer 2's job (preserves the layer boundary). Layer 1 supplies
+  raw material only: raw mask + posture + the UN-SCALED pure-β mesh +
+  scale_to_meters (pixel↔cm ruler, computed from user height).
+- Scaling touches only a limited set of regions and the analysis line
+  carries un-scaled raw data, so scaling cannot pollute Layer 2 — the
+  display/analysis separation holds by construction.
+
+### Display line (replaces the currently-bypassed Stage 2)
+- Mechanism: generate base mesh from Stage 1 β; use 4D Humans' camera/
+  pose alignment to put base mesh and the real mask in the SAME 2D frame
+  (alignment is free — this is the key advantage that makes measure-and-
+  scale viable, unlike M8's free-ΔV). Per region: measure width on the
+  mask (W_real) and on the base-mesh silhouette (W_base); factor =
+  W_real / W_base. Apply via the probe-verified Variant B soft scaling
+  (per-vertex, weighted by skinning weight, perpendicular-to-bone
+  component) — NOT the scheme's original "multiply LBS X/Z matrix",
+  which the probe ground-truth showed is not how SMPL works. Then
+  A-pose → Sapiens-normal surface detail → GLB.
+- MVP: single mid-point measurement per region, uniform scaling (tapered/
+  spindle scaling deferred).
+- Two keypoint sets, each with its own job: measure real-body widths with
+  RTMPose 2D points; measure base mesh + scale vertices with SMPL 24
+  joints + skinning weights; bridged by 4D Humans' projection. A RTMPose↔
+  SMPL correspondence table is needed (open item).
+- Scaling factors are ratios (units cancel) → do NOT need height. Height
+  is only for the analysis line's real-cm output (scale_to_meters). These
+  two were decoupled this session.
+
+### Decided this session
+- Shoulder-span widening WILL be in MVP (the 倒三角 make-or-break). It is a
+  separate lateral operation, not cylinder-segment scaling. The probe's
+  current implementation produces an unnatural acromion bump — making it
+  natural is an open technical item needing a dedicated probe.
+- Input WILL change from spinning video to two stills (front + side).
+  Rationale (note: different from the rationale rejected the night before):
+  width measurement intrinsically needs front (width) + side (depth, e.g.
+  belly projection) views, so two standard stills serve the measurement
+  need rather than dodge it; static deliberate shots also give cleaner
+  measurement bases than frame-picking from a moving video. This is a
+  project-definition-level scope change (PROJECT.md's first line says
+  "spinning video"). Developer's call: this is mandatory, not pending
+  validation. Known cost/risk to address during implementation: M2
+  (video→keyframes) is dropped; M6's cross-frame β averaging (which
+  compensated for noisy per-frame β, see NOTES M6) is gone — β stability
+  from only 2 views must be handled in implementation; per-keyframe fields
+  in Stage1Result/Stage3Result and the quality angle-coverage check change.
+
+### Open items (not yet decided)
+1. Natural shoulder-span widening — needs a dedicated probe.
+2. RTMPose↔SMPL correspondence table + how to define regions with no
+   RTMPose point (e.g. waist) — needs CC ground-truth + developer review.
+3. Width-measurement automation, incl. front/side depth — now tied to the
+   two-stills input.
+4. Whether to split width-measurement automation into its own milestone —
+   decide AFTER open item 2 (its complexity drives the split).
+5. Region table not yet filled in (per-region defining points + matched
+   joint + measurement position).
+
+### Status
+M12 planning in progress, not complete. No pipeline change yet. Direction
+and several mechanism decisions fixed; implementation milestones (M13+)
+not yet broken out.
+
+## 2026-05-28 — Project archived: Layer 1 paused on commercial-licensing grounds
+
+**Decision: body-mvp (Layer 1) is archived/paused.** Not a failure —
+a deliberate strategic pivot after the licensing reality was checked.
+
+**Why.** The core components of the Layer-1 pipeline carry non-commercial
+licenses (SMPL / smplx, 4D Humans, Sapiens — all flagged in PROJECT.md
+from the start). Developer verified that getting commercial clearance for
+this stack is effectively unworkable (cost / enterprise-only terms).
+Third-party 3D body API alternatives (e.g. 3DLook) are enterprise-priced,
+not viable for an individual developer. So the self-built 3D-mesh path
+cannot become a commercial product as currently composed.
+
+**What this does NOT invalidate.** All M11/M12 technical findings stand
+and are preserved as pre-research for a future 3D attempt:
+- SMPL's 10-dim β cannot represent decoupled/muscular builds (M11 pivot).
+- Per-bone soft scaling (Variant B: per-vertex, skinning-weight-weighted,
+  perpendicular-to-bone) works; seams stay intact (probes 1–2).
+- Anisotropic torso scaling (independent width/depth) works mechanically,
+  BUT uniform axial scaling makes the torso non-human (balloon/barrel) —
+  torso shaping needs a different method (deferred). Limbs scale fine.
+- Two-stills (front+side) input design, display/analysis split, absolute-
+  target scaling, height-as-ruler — all designed, not yet implemented.
+These are real assets. If the project resumes (own team, or affordable
+licensing), it picks up from here.
+
+**Strategic pivot going forward (NEW project, NOT this repo).** Start
+from Layer 2/3 — posture analysis + body labels + social/health value —
+built on commercially-friendly tools (RTMPose-class 2D pose + mask-based
+measurement), to reach revenue first. Much of the value (Kendall posture
+indices, waist-hip ratio, social tags) can be computed from 2D keypoints
++ mask WITHOUT a 3D mesh; the 3D mesh was mainly a visual hook, not an
+analysis necessity. The 3D layer is deferred to "after revenue / with a
+team," and is itself a possible product (sell a 3D body API — note the
+observed market gap: very few such APIs in CN, all enterprise-facing).
+
+**Boundary.** Layer 2/3 is a SEPARATE project with a different stack,
+different licensing requirements, and different goals. It must NOT be
+built inside this repo (PROJECT.md always defined Layer 2/3 as "future,
+not in this repo / separate module"). This repo stays a clean, sealed
+Layer-1 archive.
+
+Tag: (developer to set, e.g. layer1-archived)
+
+Next: when ready, start the Layer 2/3 venture as a fresh project with its
+own PROJECT/CLAUDE/NOTES and its own planning — with a clear head.
